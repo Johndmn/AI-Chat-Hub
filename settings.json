@@ -1,0 +1,8 @@
+{
+    "python.analysis.extraPaths": ["./src"],
+    "python.analysis.typeCheckingMode": "off",
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportMissingImports": "none",
+        "reportUndefinedVariable": "none"
+    }
+}

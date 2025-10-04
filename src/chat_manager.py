@@ -6,6 +6,7 @@ from langchain.schema import HumanMessage
 from langchain.memory import ConversationBufferMemory
 
 from src.config import get_config
+from src.storage import ChatStorage
 
 import logging
 import uuid
@@ -41,13 +42,18 @@ class ChatManager:
             self.session_counter = 1
             self.chat_sessions: Dict[str, Dict[str, Any]] = {}
             self.current_session_id = "default"
+            self.storage = ChatStorage()
 
-            # Создаем сессию по умолчанию
-            self.start_new_chat(
-                "default",
-                title="Главный чат",
-                custom_title=True,
-            )
+            # Загружаем сохранённые сессии
+            self._load_sessions_from_storage()
+
+            # Создаем сессию по умолчанию если её нет
+            if "default" not in self.chat_sessions:
+                self.start_new_chat(
+                    "default",
+                    title="Главный чат",
+                    custom_title=True,
+                )
 
             logger.info("ChatManager успешно инициализирован")
 
@@ -62,6 +68,58 @@ class ChatManager:
             openai_api_key=self.config.OPENAI_API_KEY,
             temperature=self.temperature,
         )
+
+    def _load_sessions_from_storage(self) -> None:
+        """Загружает все сохранённые сессии из хранилища"""
+        try:
+            saved_sessions = self.storage.load_all_sessions()
+
+            for session_id, session_data in saved_sessions.items():
+                # Восстанавливаем память из истории
+                memory = ConversationBufferMemory(return_messages=True)
+                for msg in session_data.get("history", []):
+                    if msg.get("role") == "user":
+                        memory.chat_memory.add_user_message(msg.get("content", ""))
+                    elif msg.get("role") == "assistant":
+                        memory.chat_memory.add_ai_message(msg.get("content", ""))
+
+                # Восстанавливаем полную структуру сессии
+                self.chat_sessions[session_id] = {
+                    "memory": memory,
+                    "history": session_data.get("history", []),
+                    "title": session_data.get("title", session_id),
+                    "custom_title": session_data.get("custom_title", False),
+                    "title_version": session_data.get("title_version", 0),
+                    "created_at": session_data.get("created_at"),
+                }
+
+                # Обновляем счётчик для автогенерации названий
+                title = session_data.get("title", "")
+                if title.startswith("Новый чат "):
+                    try:
+                        num = int(title.split()[-1])
+                        self.session_counter = max(
+                            self.session_counter,
+                            num + 1,
+                        )
+                    except (ValueError, IndexError):
+                        pass
+
+            logger.info(
+                "Загружено сессий из хранилища: %d",
+                len(saved_sessions),
+            )
+
+        except Exception as e:
+            logger.error("Ошибка при загрузке сессий: %s", e)
+
+    def _save_session_to_storage(self, session_id: str) -> None:
+        """Сохраняет сессию в хранилище"""
+        if session_id in self.chat_sessions:
+            self.storage.save_session(
+                session_id,
+                self.chat_sessions[session_id],
+            )
 
     def _generate_default_title(self) -> str:
         """Создает название по умолчанию для нового чата"""
@@ -98,6 +156,7 @@ class ChatManager:
 
         session = self.chat_sessions[session_id]
         sanitized = self._set_session_title(session, title, custom=True)
+        self._save_session_to_storage(session_id)
         logger.info(
             "Название сессии %s обновлено: %s",
             session_id,
@@ -232,6 +291,7 @@ class ChatManager:
 
             self.chat_sessions[session_id] = session_data
             self.current_session_id = session_id
+            self._save_session_to_storage(session_id)
 
             logger.info("Создана новая сессия: %s", session_id)
             return session_id
@@ -281,6 +341,7 @@ class ChatManager:
                 "Сообщение обработано для сессии %s",
                 self.current_session_id,
             )
+            self._save_session_to_storage(self.current_session_id)
             return response.content
 
         except Exception as e:
@@ -327,16 +388,19 @@ class ChatManager:
     def delete_session(self, session_id: str) -> bool:
         """Удалить сессию чата"""
         try:
-            if session_id == "default":
-                logger.warning("Нельзя удалить сессию по умолчанию")
-                return False
-
             if session_id in self.chat_sessions:
                 del self.chat_sessions[session_id]
+                self.storage.delete_session(session_id)
 
-                # Если удаляем текущую сессию, переключаемся на default
+                # Если удаляем текущую сессию, переключаемся на другую
                 if self.current_session_id == session_id:
-                    self.current_session_id = "default"
+                    # Находим любую оставшуюся сессию
+                    remaining = list(self.chat_sessions.keys())
+                    if remaining:
+                        self.current_session_id = remaining[0]
+                    else:
+                        # Если это была последняя сессия, обнуляем ID
+                        self.current_session_id = None
 
                 logger.info(f"Сессия {session_id} удалена")
                 return True
@@ -354,6 +418,7 @@ class ChatManager:
             session = self.get_current_session()
             session["memory"].clear()
             session["history"] = []
+            self._save_session_to_storage(self.current_session_id)
 
             logger.info(f"История сессии {self.current_session_id} очищена")
             return True
@@ -406,6 +471,9 @@ class ChatManager:
             # Обновляем текущую сессию если нужно
             if self.current_session_id == old_session_id:
                 self.current_session_id = new_session_id
+
+            self._save_session_to_storage(new_session_id)
+            self.storage.delete_session(old_session_id)
 
             logger.info(
                 "Сессия %s переименована в %s",

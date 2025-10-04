@@ -4,5 +4,32 @@
     "python.analysis.diagnosticSeverityOverrides": {
         "reportMissingImports": "none",
         "reportUndefinedVariable": "none"
+    },
+
+    // --- Добавляем автоформатирование и lint ---
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+        "source.organizeImports": true
+    },
+    "python.formatting.provider": "black",
+    "python.formatting.blackArgs": ["--line-length", "88"],
+    
+    // --- Flake8 как линтер ---
+    "python.linting.enabled": true,
+    "python.linting.flake8Enabled": true,
+    "python.linting.flake8Args": [
+        "--max-line-length=88",
+        "--extend-ignore=E203,W503"
+    ],
+
+    // --- isort ---
+    "isort.args": ["--profile", "black", "--line-length", "88"],
+
+    // --- Copilot ---
+    "github.copilot.enable": {
+        "*": true,
+        "plaintext": false,
+        "markdown": true,
+        "scminput": false
     }
 }

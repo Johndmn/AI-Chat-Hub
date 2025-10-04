@@ -40,24 +40,115 @@ def main():
         if not sessions:
             st.info("Пока нет активных чатов")
 
+        # Инициализируем состояние для подтверждения удаления
+        if "delete_confirm" not in st.session_state:
+            st.session_state["delete_confirm"] = None
+
+        # Обработка подтверждённого удаления
+        if st.session_state.get("delete_confirm"):
+            delete_id = st.session_state["delete_confirm"]
+            # Удаляем чат через менеджер
+            if chat_manager.delete_session(delete_id):
+                # Проверяем, остались ли ещё чаты
+                remaining_sessions = chat_manager.get_sessions()
+                if not remaining_sessions:
+                    # Если все чаты удалены, создаём новый
+                    new_session_id = f"chat_{uuid.uuid4().hex[:8]}"
+                    chat_manager.start_new_chat(new_session_id)
+                    st.session_state["delete_feedback"] = (
+                        "✅ Чат удалён. Создан новый чат."
+                    )
+                else:
+                    st.session_state["delete_feedback"] = "✅ Чат удалён успешно"
+            else:
+                st.session_state["delete_feedback"] = "❌ Ошибка при удалении чата"
+            # Сбрасываем состояние подтверждения
+            st.session_state["delete_confirm"] = None
+            st.rerun()
+
+        # Показываем уведомление об удалении
+        delete_feedback = st.session_state.pop("delete_feedback", None)
+        if delete_feedback:
+            st.success(delete_feedback)
+
+        # Отображаем список чатов с кнопками удаления
         for session in sessions:
             session_id = session["session_id"]
             title = session["title"]
             message_count = session["message_count"]
+
+            # Формируем метку с количеством сообщений
             if message_count:
                 label = f"💬 {title} ({message_count})"
             else:
                 label = f"💬 {title}"
+
             button_type = "primary" if session["is_current"] else "secondary"
 
-            if st.button(
-                label,
-                key=f"session_btn_{session_id}",
-                use_container_width=True,
-                type=button_type,
-            ):
-                chat_manager.switch_session(session_id)
-                st.rerun()
+            # Создаём два столбца: кнопка чата и кнопка удаления
+            col1, col2 = st.columns([5, 1])
+
+            with col1:
+                # Кнопка переключения на чат
+                if st.button(
+                    label,
+                    key=f"session_btn_{session_id}",
+                    use_container_width=True,
+                    type=button_type,
+                ):
+                    chat_manager.switch_session(session_id)
+                    st.rerun()
+
+            with col2:
+                # Кнопка удаления для всех чатов
+                if st.button(
+                    "🗑️",
+                    key=f"delete_btn_{session_id}",
+                    help="Удалить чат",
+                    type="secondary",
+                ):
+                    # Сохраняем ID чата для подтверждения
+                    st.session_state["pending_delete"] = session_id
+                    st.rerun()
+
+        # Модальное окно подтверждения удаления
+        if st.session_state.get("pending_delete"):
+            pending_id = st.session_state["pending_delete"]
+            # Находим название чата для подтверждения
+            pending_title = next(
+                (s["title"] for s in sessions if s["session_id"] == pending_id),
+                pending_id,
+            )
+
+            st.warning(
+                f"⚠️ Вы уверены, что хотите удалить чат "
+                f'"{pending_title}"? Это действие нельзя отменить.'
+            )
+
+            # Кнопки подтверждения
+            confirm_col1, confirm_col2 = st.columns(2)
+
+            with confirm_col1:
+                if st.button(
+                    "✅ Да, удалить",
+                    key="confirm_delete",
+                    type="primary",
+                    use_container_width=True,
+                ):
+                    # Подтверждаем удаление
+                    st.session_state["delete_confirm"] = pending_id
+                    st.session_state.pop("pending_delete", None)
+                    st.rerun()
+
+            with confirm_col2:
+                if st.button(
+                    "❌ Отмена",
+                    key="cancel_delete",
+                    use_container_width=True,
+                ):
+                    # Отменяем удаление
+                    st.session_state.pop("pending_delete", None)
+                    st.rerun()
 
         current_info = chat_manager.get_session_info()
         session_id = current_info["session_id"]

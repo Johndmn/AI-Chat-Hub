@@ -1,6 +1,8 @@
-import streamlit as st
-from src.chat_manager import ChatManager
 import uuid
+
+import streamlit as st
+
+from src.chat_manager import ChatManager
 
 # Настройка страницы
 st.set_page_config(

@@ -1,15 +1,14 @@
+import logging
+import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from langchain_openai import ChatOpenAI
-from langchain.schema import HumanMessage
 from langchain.memory import ConversationBufferMemory
+from langchain.schema import HumanMessage
+from langchain_openai import ChatOpenAI
 
 from src.config import get_config
 from src.storage import ChatStorage
-
-import logging
-import uuid
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)

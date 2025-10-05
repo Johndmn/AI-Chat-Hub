@@ -127,11 +127,7 @@ def main():
             pending_id = st.session_state["pending_delete"]
             # Находим название чата для подтверждения
             pending_title = next(
-                (
-                    s["title"]
-                    for s in sessions
-                    if s["session_id"] == pending_id
-                ),
+                (s["title"] for s in sessions if s["session_id"] == pending_id),
                 pending_id,
             )
 
@@ -225,6 +221,148 @@ def main():
 
         st.divider()
 
+        # Экспорт чата
+        st.subheader("Экспорт")
+
+        # Получаем историю текущего чата
+        chat_history = chat_manager.get_chat_history()
+
+        # Проверяем, есть ли сообщения для экспорта
+        if chat_history:
+            # Формируем текстовое содержимое файла
+            export_lines = []
+            for message in chat_history:
+                role = message.get("role", "")
+                content = message.get("content", "")
+
+                # Преобразуем роль в читаемый формат
+                if role == "user":
+                    export_lines.append(f"User: {content}")
+                elif role == "assistant":
+                    export_lines.append(f"AI: {content}")
+
+                # Добавляем пустую строку между сообщениями
+                export_lines.append("")
+
+            # Объединяем все строки в один текст
+            export_text = "\n".join(export_lines)
+
+            # Формируем имя файла с названием чата и датой
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            chat_title = current_info.get("title", "chat")
+            # Убираем недопустимые символы из имени файла
+            safe_title = "".join(
+                c for c in chat_title if c.isalnum() or c in (" ", "-", "_")
+            ).strip()
+            filename = f"{safe_title}_{timestamp}.txt"
+
+            # Кнопка скачивания
+            st.download_button(
+                label="📥 Скачать чат",
+                data=export_text,
+                file_name=filename,
+                mime="text/plain",
+                use_container_width=True,
+                help="Сохранить историю текущего чата в текстовый файл",
+            )
+        else:
+            # Если чат пустой, показываем информационное сообщение
+            st.info("Нет сообщений для экспорта")
+
+        st.divider()
+
+        # Быстрые промпты
+        st.subheader("Быстрые промпты")
+
+        # Инициализируем состояние для поля ввода
+        if "prompt_input" not in st.session_state:
+            st.session_state["prompt_input"] = ""
+
+        # Словарь с шаблонами промптов
+        # Каждый ключ — название промпта, значение — текст шаблона
+        prompt_templates = {
+            "essay": "Напиши подробное эссе на тему: ",
+            "explain": "Объясни следующий код:\n```\n[вставь код здесь]\n```",
+            "summarize": "Кратко резюмируй следующий текст:\n",
+        }
+
+        # Создаём три колонки для кнопок быстрых промптов
+        col1, col2, col3 = st.columns(3)
+
+        with col1:
+            # Кнопка "Написать эссе"
+            if st.button(
+                "✍️",
+                key="prompt_essay",
+                help="Написать эссе",
+                use_container_width=True,
+            ):
+                # Вставляем шаблон в поле ввода
+                st.session_state["prompt_input"] = prompt_templates["essay"]
+                st.rerun()
+
+        with col2:
+            # Кнопка "Объяснить код"
+            if st.button(
+                "🔍",
+                key="prompt_explain",
+                help="Объяснить код",
+                use_container_width=True,
+            ):
+                # Вставляем шаблон в поле ввода
+                st.session_state["prompt_input"] = prompt_templates["explain"]
+                st.rerun()
+
+        with col3:
+            # Кнопка "Резюмировать"
+            if st.button(
+                "📝",
+                key="prompt_summarize",
+                help="Резюмировать текст",
+                use_container_width=True,
+            ):
+                # Вставляем шаблон в поле ввода
+                st.session_state["prompt_input"] = prompt_templates["summarize"]
+                st.rerun()
+
+        st.divider()
+
+        # Правила общения
+        st.subheader("Правила общения")
+
+        # Инициализируем состояние для правил общения
+        if "chat_rules" not in st.session_state:
+            st.session_state["chat_rules"] = ""
+
+        # Текстовое поле для ввода правил
+        # Значение сохраняется автоматически в st.session_state["chat_rules"]
+        chat_rules = st.text_area(
+            "Инструкции для AI",
+            value=st.session_state["chat_rules"],
+            height=100,
+            placeholder=(
+                "Например:\n"
+                "- Отвечай кратко и по существу\n"
+                "- Объясняй как опытный преподаватель\n"
+                "- Используй примеры из реальной жизни"
+            ),
+            help=(
+                "Эти инструкции будут добавлены как системный промпт "
+                "перед каждым ответом модели"
+            ),
+            key="chat_rules",
+        )
+
+        # Показываем статус правил
+        if chat_rules.strip():
+            st.caption("✅ Правила активны")
+        else:
+            st.caption("ℹ️ Правила не заданы")
+
+        st.divider()
+
         # Настройки
         st.subheader("Настройки")
         current_settings = chat_manager.get_current_settings()
@@ -298,17 +436,100 @@ def main():
         with st.chat_message(message["role"]):
             st.write(message["content"])
 
-    # Поле ввода сообщения
-    if prompt := st.chat_input("Введите ваше сообщение..."):
-        # Отображаем сообщение пользователя
-        with st.chat_message("user"):
-            st.write(prompt)
+    # Проверяем, был ли выбран быстрый промпт
+    # Если да, показываем текстовое поле для редактирования
+    default_value = st.session_state.get("prompt_input", "")
 
-        # Получаем и отображаем ответ
-        with st.chat_message("assistant"):
-            with st.spinner("Думаю..."):
-                response = chat_manager.send_message(prompt)
-                st.write(response)
+    if default_value:
+        # Режим редактирования быстрого промпта
+        # Показываем текстовое поле с предзаполненным шаблоном
+        st.info("✏️ Отредактируйте шаблон и нажмите Enter для отправки")
+
+        prompt = st.text_area(
+            "Ваше сообщение:",
+            value=default_value,
+            height=120,
+            key="prompt_edit_field",
+        )
+
+        # Кнопки для отправки или отмены
+        col1, col2 = st.columns([1, 1])
+
+        with col1:
+            send_button = st.button(
+                "📤 Отправить",
+                use_container_width=True,
+                type="primary",
+            )
+
+        with col2:
+            cancel_button = st.button(
+                "❌ Отмена",
+                use_container_width=True,
+            )
+
+        # Обработка нажатия кнопок
+        if cancel_button:
+            # Отменяем — очищаем предзаполненное значение
+            st.session_state["prompt_input"] = ""
+            st.rerun()
+
+        if send_button and prompt.strip():
+            # Очищаем предзаполненное значение
+            st.session_state["prompt_input"] = ""
+
+            # Отображаем сообщение пользователя
+            with st.chat_message("user"):
+                st.write(prompt)
+
+            # Получаем и отображаем ответ
+            with st.chat_message("assistant"):
+                with st.spinner("Думаю..."):
+                    # Получаем правила общения из состояния
+                    chat_rules = st.session_state.get("chat_rules", "").strip()
+
+                    # Если правила заданы, добавляем их к сообщению
+                    if chat_rules:
+                        # Формируем расширенный промпт с правилами
+                        enhanced_prompt = (
+                            f"[Инструкции для ответа: {chat_rules}]\n\n"
+                            f"Вопрос пользователя: {prompt}"
+                        )
+                        response = chat_manager.send_message(enhanced_prompt)
+                    else:
+                        # Отправляем сообщение без правил
+                        response = chat_manager.send_message(prompt)
+
+                    st.write(response)
+            st.rerun()
+    else:
+        # Обычный режим — стандартное поле ввода чата
+        prompt = st.chat_input("Введите ваше сообщение...")
+
+        if prompt:
+            # Отображаем сообщение пользователя
+            with st.chat_message("user"):
+                st.write(prompt)
+
+            # Получаем и отображаем ответ
+            with st.chat_message("assistant"):
+                with st.spinner("Думаю..."):
+                    # Получаем правила общения из состояния
+                    chat_rules = st.session_state.get("chat_rules", "").strip()
+
+                    # Если правила заданы, добавляем их к сообщению
+                    if chat_rules:
+                        # Формируем расширенный промпт с правилами
+                        enhanced_prompt = (
+                            f"[Инструкции для ответа: {chat_rules}]\n\n"
+                            f"Вопрос пользователя: {prompt}"
+                        )
+                        response = chat_manager.send_message(enhanced_prompt)
+                    else:
+                        # Отправляем сообщение без правил
+                        response = chat_manager.send_message(prompt)
+
+                    st.write(response)
 
 
 if __name__ == "__main__":

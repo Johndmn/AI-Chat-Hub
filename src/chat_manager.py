@@ -16,21 +16,29 @@ logger = logging.getLogger(__name__)
 
 
 class ChatManager:
-    def __init__(self):
-        """Инициализация менеджера чатов"""
+    def __init__(self, api_key: Optional[str] = None):
+        """
+        Инициализация менеджера чатов
+
+        Args:
+            api_key: OpenAI API ключ (опционально, если не передан - берётся из .env)
+        """
         try:
             self.config = get_config()
 
+            # Используем переданный API ключ или из конфига
+            self.api_key = api_key or self.config.OPENAI_API_KEY
+
             # Проверим API ключ перед созданием LLM
-            if not self.config.OPENAI_API_KEY:
+            if not self.api_key:
                 raise ValueError("OpenAI API ключ не установлен")
 
-            if self.config.OPENAI_API_KEY.startswith("your_ope"):
+            if self.api_key.startswith("your_ope"):
                 raise ValueError("OpenAI API ключ содержит placeholder значение")
 
             logger.info(
                 "Используем API ключ: %s...",
-                self.config.OPENAI_API_KEY[:8],
+                self.api_key[:8],
             )
 
             self.available_models = self.config.AVAILABLE_MODELS
@@ -64,7 +72,7 @@ class ChatManager:
         """Создаем экземпляр LLM с текущими настройками"""
         return ChatOpenAI(
             model_name=self.model_name,
-            openai_api_key=self.config.OPENAI_API_KEY,
+            openai_api_key=self.api_key,
             temperature=self.temperature,
         )
 
@@ -309,7 +317,7 @@ class ChatManager:
         return self.chat_sessions[self.current_session_id]
 
     def send_message(self, message: str) -> str:
-        """Отправить сообщение и получить ответ"""
+        """Отправить сообщение и получить ответ (БЕЗ сохранения)"""
         if not message or not message.strip():
             return "Сообщение не может быть пустым"
 
@@ -340,12 +348,56 @@ class ChatManager:
                 "Сообщение обработано для сессии %s",
                 self.current_session_id,
             )
-            self._save_session_to_storage(self.current_session_id)
+            # ЗАКОММЕНТИРОВАНО: теперь сохранение происходит в app.py
+            # self._save_session_to_storage(self.current_session_id)
             return response.content
 
         except Exception as e:
             error_msg = f"Ошибка при отправке сообщения: {str(e)}"
             logger.error(error_msg)
+            return error_msg
+
+    def generate_response(
+        self, message: str, chat_history: List[Dict[str, str]]
+    ) -> str:
+        """
+        Генерирует ответ на основе сообщения и истории чата.
+        НЕ сохраняет данные - используется только для генерации.
+
+        Args:
+            message: Сообщение пользователя
+            chat_history: История чата в формате
+                         [{"role": "user"|"assistant", "content": str}]
+
+        Returns:
+            Ответ модели
+        """
+        if not message or not message.strip():
+            return "Сообщение не может быть пустым"
+
+        try:
+            # Преобразуем историю в формат LangChain
+            messages = []
+            for msg in chat_history:
+                if msg["role"] == "user":
+                    messages.append(HumanMessage(content=msg["content"]))
+                elif msg["role"] == "assistant":
+                    from langchain_core.messages import AIMessage
+
+                    messages.append(AIMessage(content=msg["content"]))
+
+            # Добавляем текущее сообщение
+            messages.append(HumanMessage(content=message))
+
+            # Получаем ответ от модели
+            response = self.llm.invoke(messages)
+
+            logger.info("Ответ сгенерирован успешно")
+            return response.content
+
+        except Exception as e:
+            error_msg = f"Ошибка при генерации ответа: {str(e)}"
+            logger.error("%s", error_msg, exc_info=True)
             return error_msg
 
     def get_chat_history(

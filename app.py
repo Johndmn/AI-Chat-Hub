@@ -87,11 +87,16 @@ def main():
 
             button_type = "primary" if session["is_current"] else "secondary"
 
-            # Создаём два столбца: кнопка чата и кнопка удаления
-            col1, col2 = st.columns([5, 1])
+            # Используем columns с фиксированным соотношением для стабильности
+            # col1 (85%) — основная кнопка чата, растягивается на всю ширину
+            # col2 (15%) — кнопка удаления фиксированного размера
+            # Такое соотношение предотвращает смещение иконки при ресайзе
+            col1, col2 = st.columns([0.85, 0.15], gap="small")
 
             with col1:
                 # Кнопка переключения на чат
+                # use_container_width=True делает кнопку адаптивной
+                # Она заполняет всю доступную ширину первой колонки
                 if st.button(
                     label,
                     key=f"session_btn_{session_id}",
@@ -103,11 +108,15 @@ def main():
 
             with col2:
                 # Кнопка удаления для всех чатов
+                # Фиксированная ширина колонки (15%) гарантирует, что иконка
+                # остаётся на одном месте относительно правого края
+                # При изменении ширины sidebar обе колонки масштабируются
+                # пропорционально, сохраняя горизонтальное выравнивание
                 if st.button(
                     "🗑️",
                     key=f"delete_btn_{session_id}",
                     help="Удалить чат",
-                    type="secondary",
+                    use_container_width=True,
                 ):
                     # Сохраняем ID чата для подтверждения
                     st.session_state["pending_delete"] = session_id
@@ -118,7 +127,11 @@ def main():
             pending_id = st.session_state["pending_delete"]
             # Находим название чата для подтверждения
             pending_title = next(
-                (s["title"] for s in sessions if s["session_id"] == pending_id),
+                (
+                    s["title"]
+                    for s in sessions
+                    if s["session_id"] == pending_id
+                ),
                 pending_id,
             )
 

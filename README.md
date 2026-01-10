@@ -46,7 +46,7 @@ With more experience, I would improve the following aspects:
 
 ---
 
-## Original Documentation (Russian)
+## Original Documentation (Legacy / Russian)
 
 # AI Tutor Chat
 

@@ -1,8 +1,8 @@
 # AI Tutor Chat
 
-> **⚠️ DISCLAIMER: LEGACY LEARNING PROJECT**
+> **DISCLAIMER: LEGACY LEARNING PROJECT**
 >
-> This repository represents an early-stage learning project. The code is functional but does not reflect current quality standards or my current skill level. It has been preserved here to demonstrate my learning curve, experimentation with Streamlit and LangChain, and the ability to build an end-to-end working application.
+> This is a legacy / early learning project. The code works, but does not represent current quality standards. The repository exists to demonstrate learning progress and experimentation.
 
 ## Project Overview
 
@@ -42,7 +42,7 @@ With more experience, I would improve the following aspects:
 
 ## Current status
 
-🛑 **Archived / Legacy – not under active development.**
+Archived / Legacy – not under active development.
 
 ---
 

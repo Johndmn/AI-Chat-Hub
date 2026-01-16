@@ -2,7 +2,7 @@
 
 > **⚠️ DISCLAIMER: LEGACY LEARNING PROJECT**
 >
-> This repository represents an early-stage learning project. The code is functional but does not reflect current quality standards or my current skill level. It has been preserved here to demonstrate my learning curve, experimentation with Streamlit and LangChain, and the ability to build an end-to-end working application.
+> This repository represents an early-stage learning project. The code is functional but does not reflect current quality standards or my current skill level. It has been preserved here to demonstrate my learning progress and experimentation.
 
 ## Project Overview
 
@@ -17,7 +17,7 @@ Key features include:
 
 ## Why this repository exists
 
-This project was created during an early learning phase to experiment with LLM integration and web application development. The primary goals were to:
+This project was created during an early learning phase to experiment, explore ideas, and build a working system end-to-end. The primary goals were to:
 -   Explore the **LangChain** ecosystem.
 -   Understand state management in **Streamlit**.
 -   Build a functional "Bring Your Own Key" system to safely share the app without exposing personal API quotas.
@@ -26,23 +26,23 @@ This project was created during an early learning phase to experiment with LLM i
 ## Current limitations
 
 As a legacy learning project, it has several known limitations:
--   **Project Structure**: The structure is not optimal, with mixed responsibilities in the main application file.
--   **Documentation**: Documentation was partially AI-generated during exploration, leading to some fragmentation across multiple files.
--   **Code Quality**: Coding standards and error handling are inconsistent compared to production-grade software.
+-   **Project Structure**: The project structure is not optimal, with mixed responsibilities in the main application file.
+-   **Documentation**: The documentation was partially AI-generated during exploration, leading to some fragmentation across multiple files.
+-   **Code Quality**: The code quality and error handling are inconsistent compared to production-grade software.
 -   **Storage**: Local JSON file storage is used for simplicity, which is not scalable for multi-user deployments.
 
 ## What I would do differently today
 
 With more experience, I would improve the following aspects:
--   **Clearer Project Structure**: Separate UI, business logic, and data access layers more strictly.
--   **Better Separation of Concerns**: Decouple the Streamlit frontend from the LangChain logic.
+-   **Clearer Project Structure**: Strictly separate UI, business logic, and data access layers.
+-   **Better Separation of Concerns**: Fully decouple the Streamlit frontend from the LangChain logic.
 -   **Cleaner Documentation Approach**: Use a centralized documentation system and maintain a decision log instead of scattered markdown files.
 -   **Explicit Requirements**: Define scope and requirements more clearly upfront to avoid "feature creep."
 -   **Testing**: Implement a proper testing suite (Unit/Integration) which is currently absent.
 
 ## Current status
 
-🛑 **Archived / Legacy – not under active development.**
+🛑 **Archived / Legacy - Not under active development.**
 
 ---
 

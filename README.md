@@ -1,48 +1,34 @@
-# AI Tutor Chat
-
 > **⚠️ DISCLAIMER: LEGACY LEARNING PROJECT**
 >
-> This repository represents an early-stage learning project. The code is functional but does not reflect current quality standards or my current skill level. It has been preserved here to demonstrate my learning curve, experimentation with Streamlit and LangChain, and the ability to build an end-to-end working application.
+> This is a legacy / early learning project. The code works, but does not represent current quality standards. This repository exists to demonstrate learning progress and experimentation.
+
+# AI Tutor Chat
 
 ## Project Overview
 
-AI Tutor Chat is an interactive web application built with **Streamlit** and **LangChain**. It provides a user-friendly interface for chatting with OpenAI's language models (GPT-3.5, GPT-4).
-
-Key features include:
--   **Multi-session management**: Create, rename, and switch between multiple chat histories.
--   **Customizable Settings**: Adjust model parameters (temperature) and switch between available models.
--   **BYOK (Bring Your Own Key)**: Users can securely input their own OpenAI API key for session-based usage.
--   **Persistent History**: Chat sessions are stored locally, preserving context between reloads.
--   **Utility Features**: Token counting, chat export to text, and "quick prompt" templates for common tasks.
+AI Tutor Chat is an interactive web application that enables users to chat with OpenAI language models. It implements a "Bring Your Own Key" (BYOK) system, allowing users to securely use their own API credentials. The application supports multiple chat sessions, model configuration (temperature, model selection), and local chat history persistence.
 
 ## Why this repository exists
 
-This project was created during an early learning phase to experiment with LLM integration and web application development. The primary goals were to:
--   Explore the **LangChain** ecosystem.
--   Understand state management in **Streamlit**.
--   Build a functional "Bring Your Own Key" system to safely share the app without exposing personal API quotas.
--   Deliver a complete, end-to-end working system.
+This project was created during an early learning phase to experiment, explore ideas, and build a working system end-to-end. The primary goal was to gain hands-on experience with **Streamlit** for UI development and **LangChain** for LLM orchestration, moving from concept to a functional application.
 
 ## Current limitations
 
-As a legacy learning project, it has several known limitations:
--   **Project Structure**: The structure is not optimal, with mixed responsibilities in the main application file.
--   **Documentation**: Documentation was partially AI-generated during exploration, leading to some fragmentation across multiple files.
--   **Code Quality**: Coding standards and error handling are inconsistent compared to production-grade software.
--   **Storage**: Local JSON file storage is used for simplicity, which is not scalable for multi-user deployments.
+-   **Project structure is not optimal**: The codebase has mixed responsibilities, with UI and logic often intertwined.
+-   **Documentation was partially AI-generated during exploration**: This resulted in a large number of markdown files and some fragmentation in the documentation.
+-   **Code quality is inconsistent**: Being an early project, the coding standards and error handling do not meet modern production benchmarks.
 
 ## What I would do differently today
 
-With more experience, I would improve the following aspects:
--   **Clearer Project Structure**: Separate UI, business logic, and data access layers more strictly.
--   **Better Separation of Concerns**: Decouple the Streamlit frontend from the LangChain logic.
--   **Cleaner Documentation Approach**: Use a centralized documentation system and maintain a decision log instead of scattered markdown files.
--   **Explicit Requirements**: Define scope and requirements more clearly upfront to avoid "feature creep."
--   **Testing**: Implement a proper testing suite (Unit/Integration) which is currently absent.
+-   **Clearer project structure**: I would organize the codebase with a strict separation of concerns (e.g., separate layers for UI, business logic, and data).
+-   **Better separation of concerns**: Decouple the Streamlit frontend from the core logic to make the system more testable and maintainable.
+-   **Cleaner documentation approach**: Instead of generating many ad-hoc markdown files, I would maintain a centralized and structured documentation base.
+-   **Decision logging instead of excessive markdown**: I would use a lightweight decision log (ADR) rather than creating verbose separate files for every change.
+-   **More explicit requirements and scope definition**: I would define the scope more rigorously upfront to prevent scope creep and ensure a focused implementation.
 
 ## Current status
 
-🛑 **Archived / Legacy – not under active development.**
+**Archived / Legacy – not under active development**
 
 ---
 

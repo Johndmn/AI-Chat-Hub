@@ -7,7 +7,7 @@
 ## 1. Дерево проекта и ответственность файлов
 
 ```text
-AI-Chat-BYOK/
+AI-Chat-Hub/
 ├── app.py                  # Слой представления (Presentation Layer / Streamlit UI)
 ├── src/                    # Бизнес-логика и доменные сервисы (Application & Domain Layer)
 │   ├── __init__.py         # Экспорт публичного интерфейса пакета src

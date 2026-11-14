@@ -129,5 +129,5 @@
 
 ## Контакты
 
-- Telegram: [вставить]
-- Email: [вставить]
+- Telegram: https://t.me/lonelyhunter18
+- Email: javohirnodirov1718@gmail.com

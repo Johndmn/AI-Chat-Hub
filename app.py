@@ -1,956 +1,1415 @@
-import time
-import uuid
-from datetime import datetime
+"""
+Главный модуль веб-интерфейса Streamlit (app.py).
+
+Архитектурная роль файла:
+Отвечает исключительно за отображение интерфейса (Presentation Layer)
+и связывание действий пользователя с бизнес-логикой из пакета `src/`:
+- `AppConfig` и `PROVIDERS` (src/config.py) — настройки провайдеров и демо-режима;
+- `DemoRateLimiter` (src/rate_limiter.py) — общий счётчик бесплатных запросов и таймер;
+- `ChatSessionManager` (src/chat_state.py) — управление чатами в сессии пользователя;
+- `LLMService` и `TokenCounter` (src/llm_service.py) — запросы к моделям, автоподгрузка
+  живого списка моделей (`fetch_available_models`) и подсчёт токенов.
+"""
+
+from typing import List, Optional, Tuple
 
 import streamlit as st
-import tiktoken
 
-from src.chat_manager import ChatManager
+from src.chat_state import ChatSessionManager
+from src.config import PROMPT_TEMPLATES, PROVIDERS, AppConfig, get_provider
+from src.document_parser import DocumentParser, DocumentParserError
+from src.jira_pm_service import (
+    AnalysisType,
+    JiraIssue,
+    JiraPMService,
+    JiraPushService,
+)
+from src.llm_service import (
+    LLMService,
+    ProviderClientError,
+    ProviderRateLimitError,
+    ResponseTelemetry,
+    TokenCounter,
+)
+from src.rate_limiter import DemoRateLimiter
 
-# ============================================
-# Вспомогательные функции для UX-улучшений
-# ============================================
-
-
-def count_tokens(text: str, model: str = "gpt-3.5-turbo") -> int:
-    """
-    Подсчитывает количество токенов в тексте для заданной модели.
-
-    Args:
-        text: Текст для подсчёта токенов
-        model: Название модели для выбора подходящего токенизатора
-
-    Returns:
-        Количество токенов в тексте
-    """
-    try:
-        enc = tiktoken.encoding_for_model(model)
-        return len(enc.encode(text))
-    except Exception:
-        # Если модель не поддерживается, используем cl100k_base (GPT-4/3.5)
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-
-
-def calculate_total_tokens(chat_history: list, model: str = "gpt-3.5-turbo") -> int:
-    """
-    Вычисляет общее количество токенов во всей истории чата.
-
-    Args:
-        chat_history: Список сообщений чата
-        model: Название модели для токенизации
-
-    Returns:
-        Суммарное количество токенов
-    """
-    total = 0
-    for message in chat_history:
-        content = message.get("content", "")
-        total += count_tokens(content, model)
-    return total
-
-
-def show_typing_indicator(placeholder, duration: float = 2.0):
-    """
-    Отображает анимированный индикатор "🤖 Печатает..." с пульсирующими точками.
-
-    Args:
-        placeholder: st.empty() объект для обновления содержимого
-        duration: Общая длительность анимации в секундах
-    """
-    dots_states = [".", "..", "..."]
-    iterations = int(duration / 0.3)  # Каждая итерация длится 0.3 секунды
-
-    for i in range(iterations):
-        dots = dots_states[i % len(dots_states)]
-        placeholder.markdown(
-            f"<div style='color: #888; font-style: italic;'>🤖 Печатает{dots}</div>",
-            unsafe_allow_html=True,
-        )
-        time.sleep(0.3)
-
-
-def format_timestamp(dt: datetime = None) -> str:
-    """
-    Форматирует временную метку в читаемый вид.
-
-    Args:
-        dt: Объект datetime (если None, используется текущее время)
-
-    Returns:
-        Строка с отформатированным временем в формате HH:MM:SS
-    """
-    if dt is None:
-        dt = datetime.now()
-    return dt.strftime("%H:%M:%S")
-
-
-def display_message_with_timestamp(role: str, content: str):
-    """
-    Отображает сообщение чата с временной меткой внизу.
-
-    Args:
-        role: Роль отправителя ('user' или 'assistant')
-        content: Содержимое сообщения
-    """
-    with st.chat_message(role):
-        st.write(content)
-        # Отображаем время сообщения серым текстом справа
-        timestamp = format_timestamp()
-        st.markdown(
-            f"<div style='font-size:0.8em; color:#888; text-align:right; "
-            f"margin-top:-10px;'>{timestamp}</div>",
-            unsafe_allow_html=True,
-        )
-
-
-# ============================================
-# Настройка страницы
-# ============================================
+# =====================================================================
+# 1. Настройка страницы Streamlit
+# =====================================================================
 
 st.set_page_config(
-    page_title="AI Tutor Chat",
+    page_title="AI Chat Hub — Multi-Provider BYOK & Demo",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 
-# ============================================
-# Инициализация состояния сессии для BYOK
-# ============================================
+# =====================================================================
+# 2. Глобальные объекты сервера (общие для 5–10+ одновременных пользователей)
+# =====================================================================
 
 
-def init_session_state():
+def get_app_config() -> AppConfig:
+    """Читает актуальную конфигурацию сервера (.env / st.secrets)."""
+    return AppConfig.from_env()
+
+
+@st.cache_resource
+def get_global_rate_limiter(daily_limit: int, session_limit: int) -> DemoRateLimiter:
     """
-    Инициализирует переменные состояния для BYOK и чатов.
-
-    Переменные:
-    - api_key: OpenAI API ключ (вводится пользователем)
-    - chats: словарь всех чатов {chat_id: {"title": str, "messages": list}}
-    - active_chat: ID текущего активного чата
-    - chat_counter: счётчик для нумерации новых чатов
+    Создаёт единый потокобезопасный (thread-safe) экземпляр лимитера на весь сервер.
+    Все пользователи, открывшие сайт одновременно, разделяют этот счётчик.
     """
-    # Инициализация API ключа
-    if "api_key" not in st.session_state:
-        st.session_state.api_key = ""
-
-    # Инициализация чатов - словарь всех чатов
-    if "chats" not in st.session_state:
-        # Создаём первый чат по умолчанию
-        first_chat_id = f"chat_{uuid.uuid4().hex[:8]}"
-        st.session_state.chats = {
-            first_chat_id: {
-                "title": "Новый чат 1",
-                "messages": [],  # История сообщений [{role: str, content: str}]
-            }
-        }
-        st.session_state.active_chat = first_chat_id  # Устанавливаем как активный
-        st.session_state.chat_counter = 2  # Счётчик для следующих чатов
-
-    # Инициализация активного чата (если не задан)
-    if "active_chat" not in st.session_state:
-        # Если по какой-то причине active_chat не задан, берём первый чат
-        if st.session_state.chats:
-            st.session_state.active_chat = list(st.session_state.chats.keys())[0]
-        else:
-            st.session_state.active_chat = None
-
-    # Инициализация счётчика (если не задан)
-    if "chat_counter" not in st.session_state:
-        st.session_state.chat_counter = len(st.session_state.chats) + 1
+    return DemoRateLimiter(
+        daily_global_limit=daily_limit,
+        session_limit=session_limit,
+    )
 
 
-# Инициализация менеджера чатов
-def get_chat_manager():
-    """
-    Создаёт экземпляр ChatManager с API ключом из session_state.
-
-    Returns:
-        ChatManager или None, если ключ не введён
-    """
-    if st.session_state.api_key:
-        try:
-            return ChatManager(api_key=st.session_state.api_key)
-        except Exception as e:
-            st.error(f"❌ Ошибка инициализации ChatManager: {str(e)}")
-            return None
-    return None
+# =====================================================================
+# 3. Вспомогательные функции UI и получения живого списка моделей
+# =====================================================================
 
 
-def main():
-    """Главная функция приложения с поддержкой BYOK."""
-    # Инициализируем состояние сессии
-    init_session_state()
-
-    # ============================================
-    # Проверка API ключа
-    # ============================================
-
-    # Если API ключ не введён, показываем форму для ввода
-    if not st.session_state.api_key:
-        st.title("🤖 AI Tutor Chat")
-        st.caption("Для начала работы введите свой OpenAI API ключ")
-
-        # Центрируем форму
-        col1, col2, col3 = st.columns([1, 2, 1])
-
-        with col2:
-            st.markdown("### 🔑 Ввод API ключа")
-            st.info(
-                "Ваш API ключ будет использоваться только в текущей сессии "
-                "и не будет сохранён на диск."
-            )
-
-            # Поле ввода API ключа
-            api_key_input = st.text_input(
-                "OpenAI API Key",
-                type="password",
-                placeholder="sk-...",
-                help="Введите ваш OpenAI API ключ",
-                key="api_key_input_field",
-            )
-
-            # Кнопка для сохранения ключа
-            if st.button("💾 Сохранить и начать работу", use_container_width=True):
-                if api_key_input.strip():
-                    st.session_state.api_key = api_key_input.strip()
-                    st.success("✅ Ключ сохранён. Инициализация...")
-                    st.rerun()
-                else:
-                    st.error("❌ Пожалуйста, введите корректный API ключ")
-
-            st.divider()
-
-            # Инструкция по получению ключа
-            with st.expander("📖 Как получить API ключ?"):
-                st.markdown(
-                    """
-                    1. Перейдите на [platform.openai.com](https://platform.openai.com/)
-                    2. Войдите в свой аккаунт или создайте новый
-                    3. Перейдите в раздел **API Keys**
-                    4. Нажмите **Create new secret key**
-                    5. Скопируйте ключ и вставьте его выше
-                    
-                    ⚠️ **Важно:** Храните ключ в безопасности!
-                    """
-                )
-
-        # Останавливаем выполнение, пока не введён ключ
-        st.stop()
-
-    # ============================================
-    # Инициализация ChatManager с API ключом
-    # ============================================
-
-    chat_manager = get_chat_manager()
-
-    if chat_manager is None:
-        st.error("❌ Ошибка инициализации ChatManager. Проверьте API ключ.")
-        if st.button("🔄 Сбросить ключ и попробовать снова"):
-            st.session_state.api_key = ""
-            st.rerun()
-        st.stop()
-
-    # ============================================
-    # САЙДБАР (боковая панель с настройками)
-    # ============================================
-
-    # Добавляем CSS для центрирования иконки удаления
+def inject_custom_css() -> None:
+    """Добавляет аккуратные CSS-стили, адаптивные к тёмной и светлой теме."""
     st.markdown(
         """
-    <style>
-    /* Центрирование иконки удаления по вертикали */
-    /* Находим все кнопки удаления и центрируем их */
-    [data-testid="column"] > div > div > div > button[kind="secondary"] {
-        margin-top: auto;
-        margin-bottom: auto;
-    }
-    
-    /* Альтернативный способ: центрирование через flex для второй колонки */
-    div[data-testid="stHorizontalBlock"] > div:nth-child(2) {
-        display: flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-    }
-    
-    /* Убираем лишние отступы у кнопки удаления */
-    div[data-testid="stHorizontalBlock"] > div:nth-child(2) button {
-        margin: 0 !important;
-    }
-    </style>
-    """,
+        <style>
+        /* Выравнивание кнопки удаления чата (корзины) по центру строки */
+        div[data-testid="stHorizontalBlock"] > div:nth-child(2) {
+            display: flex !important;
+            align-items: center !important;
+            justify-content: center !important;
+        }
+        div[data-testid="stHorizontalBlock"] > div:nth-child(2) button {
+            margin: 0 !important;
+        }
+        /* Плашка счётчика токенов и режима (адаптивна к тёмной и светлой теме) */
+        .status-banner {
+            text-align: center;
+            color: inherit;
+            font-size: 0.9em;
+            padding: 10px 14px;
+            background-color: rgba(128, 128, 128, 0.14);
+            border: 1px solid rgba(128, 128, 128, 0.25);
+            border-radius: 8px;
+            margin-bottom: 14px;
+        }
+        /* Таймер исчерпания бесплатного лимита */
+        .limit-timer-box {
+            padding: 14px 18px;
+            border-radius: 8px;
+            border-left: 5px solid #e53e3e;
+            background-color: rgba(229, 62, 62, 0.12);
+            color: inherit;
+            margin-bottom: 16px;
+        }
+        </style>
+        """,
         unsafe_allow_html=True,
     )
 
+
+def render_message(
+    role: str,
+    content: str,
+    timestamp: str,
+    telemetry: Optional[ResponseTelemetry] = None,
+) -> None:
+    """
+    Отрисовывает одно сообщение чата с временной меткой
+    и опциональной инженерной телеметрией ответа модели.
+    """
+    with st.chat_message(role):
+        st.markdown(content)
+        if telemetry:
+            st.caption(telemetry.format_line())
+        if timestamp:
+            st.markdown(
+                f"<div style='font-size:0.75em; color:#888; "
+                f"text-align:right; margin-top:-8px;'>{timestamp}</div>",
+                unsafe_allow_html=True,
+            )
+
+
+def get_models_for_provider(
+    session_mgr: ChatSessionManager,
+    provider_id: str,
+) -> List[str]:
+    """
+    Возвращает список моделей для провайдера:
+    если для этого провайдера уже был загружен «живой» список через API —
+    возвращает его; иначе возвращает базовый список из конфига.
+    """
+    fetched_map = session_mgr.state.get("fetched_models", {})
+    live_list = fetched_map.get(provider_id)
+    if live_list:
+        return live_list
+    return get_provider(provider_id).models
+
+
+def build_active_llm_service(
+    session_mgr: ChatSessionManager,
+    config: AppConfig,
+    max_tokens: Optional[int] = None,
+) -> Tuple[Optional[LLMService], str]:
+    """
+    Создаёт экземпляр LLMService в зависимости от выбранного режима:
+    - 'demo': использует встроенный серверный ключ бесплатного API;
+    - 'byok': использует пользовательский ключ и выбранного провайдера.
+
+    Args:
+        max_tokens: позволяет переопределить лимит токенов для задачи
+                    (например, 4096 для Jira-анализа).
+    """
+    mode = session_mgr.state.get("auth_mode", "byok")
+    temperature = float(
+        session_mgr.state.get("temperature", config.default_temperature)
+    )
+
+    if mode == "demo":
+        if not config.is_demo_configured:
+            return None, "Демо-ключ не задан на сервере"
+        active_demo_model = (
+            str(session_mgr.state.get("demo_model_override", "")).strip()
+            or config.demo_model_name
+        )
+        service = LLMService(
+            api_key=config.demo_api_key,
+            base_url=config.demo_base_url,
+            model_name=active_demo_model,
+            temperature=temperature,
+            max_tokens=max_tokens or 1024,
+        )
+        label = f"🎁 Демо ({active_demo_model})"
+        return service, label
+
+    # Режим BYOK (собственный ключ пользователя)
+    api_key = str(session_mgr.state.get("api_key", "")).strip()
+    if not api_key:
+        return None, "Ожидание API-ключа (BYOK)"
+
+    provider_id = session_mgr.state.get("provider_id", "openrouter")
+    provider = get_provider(provider_id)
+
+    base_url = (
+        str(session_mgr.state.get("custom_base_url", "")).strip()
+        if provider_id == "custom"
+        else provider.base_url
+    )
+
+    custom_model = str(session_mgr.state.get("custom_model_name", "")).strip()
+    selected_model = str(session_mgr.state.get("selected_model", "")).strip()
+    model_name = custom_model or selected_model or provider.default_model
+
+    service = LLMService(
+        api_key=api_key,
+        base_url=base_url,
+        model_name=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens or 2048,
+    )
+    label = f"🔑 {provider.name.split()[1]} ({model_name})"
+    return service, label
+
+
+# =====================================================================
+# 4. Всплывающее модальное окно настроек API и живого списка моделей
+# =====================================================================
+
+
+@st.dialog("🔌 Настройки подключения, API-ключей и моделей", width="large")
+def open_api_settings_dialog(
+    session_mgr: ChatSessionManager,
+    config: AppConfig,
+) -> None:
+    """
+    Всплывающее модальное окно (как в современных агентских IDE вроде OpenCode)
+    для управления провайдерами, API-ключами и автоподгрузкой живого списка моделей.
+    """
+    st.caption(
+        "Здесь вы можете переключаться между бесплатным Демо-режимом и своими API-ключами "
+        "(BYOK), а также загружать актуальный список моделей напрямую с сервера провайдера."
+    )
+
+    # Переключатель режима внутри модального окна
+    is_byok_now = session_mgr.state.get("auth_mode") == "byok"
+    use_byok = st.toggle(
+        "🔑 Использовать свой API-ключ (режим BYOK)",
+        value=is_byok_now,
+        help="Выключено — работает встроенный бесплатный Демо API. Включено — работает ваш собственный ключ.",
+    )
+    session_mgr.state["auth_mode"] = "byok" if use_byok else "demo"
+
+    st.divider()
+
+    if not use_byok:
+        st.markdown("### 🎁 Настройки Бесплатного Демо-режима")
+        if not config.is_demo_configured:
+            st.warning(
+                "На сервере не настроен `DEMO_API_KEY`. Включите переключатель BYOK выше "
+                "и введите свой ключ."
+            )
+            return
+
+        st.success(f"Подключён демо-сервер: `{config.demo_base_url}`")
+
+        # Кнопка автоподгрузки живых моделей для демо-ключа
+        demo_models = session_mgr.state.get("fetched_models", {}).get(
+            "__demo__",
+            [
+                config.demo_model_name,
+                "openai/gpt-oss-120b",
+                "openai/gpt-oss-20b",
+                "qwen/qwen3.8-27b",
+                "allam-2-7b",
+            ],
+        )
+        # Убираем дубликаты с сохранением порядка
+        demo_models = list(dict.fromkeys(demo_models))
+
+        if st.button(
+            "🔄 Проверить и обновить живой список демо-моделей с сервера",
+            use_container_width=True,
+        ):
+            with st.spinner("Запрашиваем список доступных моделей у сервера..."):
+                live_demo = LLMService.fetch_available_models(
+                    api_key=config.demo_api_key,
+                    base_url=config.demo_base_url,
+                )
+                if live_demo:
+                    session_mgr.state["fetched_models"]["__demo__"] = live_demo
+                    demo_models = live_demo
+                    st.success(f"✅ Найдено доступных чат-моделей: {len(live_demo)}")
+                else:
+                    st.warning(
+                        "Сервер не вернул список моделей, используем базовый список."
+                    )
+
+        current_demo_model = (
+            session_mgr.state.get("demo_model_override") or config.demo_model_name
+        )
+        if current_demo_model not in demo_models:
+            demo_models.insert(0, current_demo_model)
+
+        chosen_demo_model = st.selectbox(
+            "Выберите бесплатную модель для Демо-режима:",
+            options=demo_models,
+            index=demo_models.index(current_demo_model),
+        )
+        session_mgr.state["demo_model_override"] = chosen_demo_model
+
+        if st.button("✅ Применить и закрыть", type="primary", use_container_width=True):
+            st.rerun()
+        return
+
+    # --- Вкладка настройки своего ключа (BYOK) ---
+    st.markdown("### 🔑 Подключение собственного провайдера (BYOK)")
+
+    provider_ids = list(PROVIDERS.keys())
+    current_pid = session_mgr.state.get("provider_id", "openrouter")
+    if current_pid not in provider_ids:
+        current_pid = "openrouter"
+
+    chosen_pid = st.selectbox(
+        "1. Выберите AI-провайдера:",
+        options=provider_ids,
+        index=provider_ids.index(current_pid),
+        format_func=lambda pid: PROVIDERS[pid].name,
+    )
+    if chosen_pid != current_pid:
+        session_mgr.state["provider_id"] = chosen_pid
+        session_mgr.state["selected_model"] = PROVIDERS[chosen_pid].default_model
+
+    provider = get_provider(chosen_pid)
+    st.caption(f"ℹ️ {provider.description} — [Получить API-ключ ↗]({provider.docs_url})")
+
+    if chosen_pid == "custom":
+        custom_url = st.text_input(
+            "Base URL совместимого сервера:",
+            value=session_mgr.state.get("custom_base_url") or provider.base_url,
+            placeholder="https://api.example.com/v1",
+        )
+        session_mgr.state["custom_base_url"] = custom_url.strip()
+
+    active_base_url = (
+        session_mgr.state.get("custom_base_url") or provider.base_url
+        if chosen_pid == "custom"
+        else provider.base_url
+    )
+
+    api_key_input = st.text_input(
+        f"2. Введите ваш API-ключ ({provider.name.split()[1]}):",
+        value=session_mgr.state.get("api_key", ""),
+        type="password",
+        placeholder=provider.key_placeholder,
+        help="Ключ хранится исключительно в памяти вашей текущей вкладки браузера.",
+    )
+
+    # Кнопка живой автоподгрузки списка моделей по введённому ключу
+    col_fetch, col_clear = st.columns([0.7, 0.3])
+    with col_fetch:
+        if st.button(
+            "🔄 Загрузить живой список моделей по ключу",
+            use_container_width=True,
+            help="Отправляет запрос GET /models к выбранному провайдеру и подгружает все реально доступные вам модели.",
+        ):
+            if not api_key_input.strip():
+                st.error("Сначала введите API-ключ в поле выше.")
+            else:
+                session_mgr.state["api_key"] = api_key_input.strip()
+                with st.spinner(
+                    f"Запрашиваем доступные модели у {provider.name.split()[1]}..."
+                ):
+                    live_models = LLMService.fetch_available_models(
+                        api_key=api_key_input.strip(),
+                        base_url=active_base_url,
+                    )
+                    if live_models:
+                        session_mgr.state["fetched_models"][chosen_pid] = live_models
+                        session_mgr.state["selected_model"] = live_models[0]
+                        st.success(
+                            f"✅ Успешно загружено моделей с сервера: {len(live_models)} шт."
+                        )
+                    else:
+                        st.warning(
+                            "Не удалось получить список через /models (проверьте ключ или используйте стандартный список ниже)."
+                        )
+    with col_clear:
+        if st.button("🗑️ Сбросить ключ", use_container_width=True):
+            session_mgr.state["api_key"] = ""
+            st.toast("Ключ очищен")
+
+    available_models = get_models_for_provider(session_mgr, chosen_pid)
+    is_live = chosen_pid in session_mgr.state.get("fetched_models", {})
+
+    current_selected = session_mgr.state.get("selected_model", "")
+    if current_selected not in available_models:
+        current_selected = available_models[0]
+
+    model_label = (
+        f"3. Выберите модель (🟢 Живой список с сервера: {len(available_models)} шт.):"
+        if is_live
+        else "3. Выберите модель (базовый список провайдера):"
+    )
+    chosen_model = st.selectbox(
+        model_label,
+        options=available_models,
+        index=available_models.index(current_selected),
+    )
+
+    custom_model_input = st.text_input(
+        "Или введите точный ID модели вручную (необязательно):",
+        value=session_mgr.state.get("custom_model_name", ""),
+        placeholder="Оставьте пустым, чтобы использовать модель из списка выше",
+    )
+
+    st.divider()
+    if st.button("💾 Сохранить настройки и закрыть", type="primary", use_container_width=True):
+        session_mgr.state["api_key"] = api_key_input.strip()
+        session_mgr.state["selected_model"] = chosen_model
+        session_mgr.state["custom_model_name"] = custom_model_input.strip()
+
+        # Если ключ введён, а живой список ещё не запрашивался — пробуем подгрузить автоматически
+        if (
+            api_key_input.strip()
+            and chosen_pid not in session_mgr.state.get("fetched_models", {})
+        ):
+            live_models = LLMService.fetch_available_models(
+                api_key=api_key_input.strip(),
+                base_url=active_base_url,
+            )
+            if live_models:
+                session_mgr.state["fetched_models"][chosen_pid] = live_models
+
+        st.rerun()
+
+
+# =====================================================================
+# 5. Отрисовка боковой панели (Сайдбар)
+# =====================================================================
+
+
+def render_workspace_selector(session_mgr: ChatSessionManager) -> None:
+    """
+    Переключатель рабочего пространства в верхней части сайдбара.
+    Позволяет быстро переключаться между чатом и PM-инструментом.
+    """
+    options = {
+        "chat": "💬 AI Чат-Ассистент",
+        "jira": "📋 Jira & PM Copilot",
+    }
+    current = session_mgr.state.get("workspace_mode", "chat")
+    if current not in options:
+        current = "chat"
+        session_mgr.state["workspace_mode"] = current
+
+    selected = st.radio(
+        "Рабочее пространство:",
+        options=list(options.keys()),
+        index=list(options.keys()).index(current),
+        format_func=lambda key: options[key],
+        label_visibility="collapsed",
+    )
+    if selected != current:
+        session_mgr.state["workspace_mode"] = selected
+        st.rerun()
+
+
+def render_sidebar(
+    session_mgr: ChatSessionManager,
+    config: AppConfig,
+    rate_limiter: DemoRateLimiter,
+) -> None:
+    """Отрисовывает компактную боковую панель с быстрым переключателем и кнопкой модального окна."""
     with st.sidebar:
-        st.title("💬 Настройки чата")
+        render_workspace_selector(session_mgr)
+        st.title("⚙️ Управление")
 
-        # Показываем статус API ключа
-        st.success("✅ API ключ активен")
+        # --- БЛОК 1: Мгновенный переключатель Демо / BYOK + кнопка модального окна ---
+        st.subheader("🔌 Режим API")
 
-        # Кнопка для очистки ключа
-        if st.button("🗑️ Очистить ключ", use_container_width=True):
-            st.session_state.api_key = ""
-            st.session_state.chat_manager_initialized = False
-            st.info("🔄 Ключ удалён. Перезагрузка...")
-            st.rerun()
+        def _on_toggle_mode() -> None:
+            """Callback мгновенного переключения между бесплатным Демо и своим ключом BYOK."""
+            new_val = st.session_state.get("sidebar_byok_toggle", False)
+            session_mgr.state["auth_mode"] = "byok" if new_val else "demo"
 
-        st.divider()
+        is_byok = session_mgr.state.get("auth_mode") == "byok"
+        st.session_state["sidebar_byok_toggle"] = is_byok
 
-        # --- Кнопка создания нового чата ---
-        if st.button("🆕 Новый чат", use_container_width=True):
-            # Генерируем уникальный ID для нового чата
-            new_chat_id = f"chat_{uuid.uuid4().hex[:8]}"
-            # Создаём новый чат в session_state
-            st.session_state.chats[new_chat_id] = {
-                "title": f"Новый чат {st.session_state.chat_counter}",
-                "messages": [],
-            }
-            st.session_state.chat_counter += 1
-            # Делаем новый чат активным
-            st.session_state.active_chat = new_chat_id
-            st.rerun()
+        st.toggle(
+            "🔑 Свой API-ключ (BYOK)",
+            key="sidebar_byok_toggle",
+            on_change=_on_toggle_mode,
+            help="Выключено — работает бесплатный встроенный Демо API. Включено — работает ваш собственный ключ.",
+        )
 
-        st.divider()
-
-        # --- История чатов ---
-        st.subheader("История чатов")
-
-        if not st.session_state.chats:
-            st.info("Пока нет активных чатов")
-
-        # Инициализируем состояние для подтверждения удаления
-        if "delete_confirm" not in st.session_state:
-            st.session_state["delete_confirm"] = None
-
-        # --- Обработка подтверждённого удаления чата ---
-        if st.session_state.get("delete_confirm"):
-            delete_id = st.session_state["delete_confirm"]
-            # Удаляем чат из session_state
-            if delete_id in st.session_state.chats:
-                del st.session_state.chats[delete_id]
-
-                # Проверяем, остались ли ещё чаты
-                if not st.session_state.chats:
-                    # Если все чаты удалены, создаём новый
-                    new_chat_id = f"chat_{uuid.uuid4().hex[:8]}"
-                    st.session_state.chats[new_chat_id] = {
-                        "title": f"Новый чат {st.session_state.chat_counter}",
-                        "messages": [],
-                    }
-                    st.session_state.chat_counter += 1
-                    st.session_state.active_chat = new_chat_id
-                    st.session_state["delete_feedback"] = (
-                        "✅ Чат удалён. Создан новый чат."
+        # Отображаем краткий статус текущего режима
+        if not is_byok:
+            if config.is_demo_configured:
+                status = rate_limiter.check_status(
+                    session_used=int(session_mgr.state.get("demo_session_used", 0))
+                )
+                active_demo_model = (
+                    session_mgr.state.get("demo_model_override")
+                    or config.demo_model_name
+                )
+                if status.allowed:
+                    st.success(
+                        f"🎁 **Бесплатный Демо активен**\n\n"
+                        f"• Модель: `{active_demo_model}`\n"
+                        f"• Осталось в сессии: **{status.remaining_session}**\n"
+                        f"• Дневной пул: **{status.remaining_global}**"
                     )
                 else:
-                    # Если удалили активный чат, переключаемся на первый
-                    if st.session_state.active_chat == delete_id:
-                        st.session_state.active_chat = list(
-                            st.session_state.chats.keys()
-                        )[0]
-                    st.session_state["delete_feedback"] = "✅ Чат удалён успешно"
+                    st.error(
+                        f"⏳ **Лимит исчерпан**\n\n"
+                        f"Сброс через: **{status.formatted_timer}**"
+                    )
             else:
-                st.session_state["delete_feedback"] = "❌ Ошибка при удалении чата"
-            # Сбрасываем состояние подтверждения
-            st.session_state["delete_confirm"] = None
+                st.warning("⚠️ Демо-ключ не задан. Включите тумблер BYOK выше.")
+        else:
+            provider = get_provider(session_mgr.state.get("provider_id", "openrouter"))
+            has_key = bool(str(session_mgr.state.get("api_key", "")).strip())
+            if has_key:
+                st.success(f"🔑 **BYOK подключён**\n\nПровайдер: {provider.name}")
+            else:
+                st.warning("🔑 **Режим BYOK**\n\nКлюч ещё не введён.")
+
+        # Кнопка вызова всплывающего окна настроек (как в агентских IDE)
+        if st.button(
+            "⚙️ Настроить API и модели",
+            use_container_width=True,
+            type="primary" if (is_byok and not session_mgr.state.get("api_key")) else "secondary",
+        ):
+            open_api_settings_dialog(session_mgr, config)
+
+        st.divider()
+
+        # --- БЛОК 2: Управление списком чатов ---
+        st.subheader("💬 История чатов")
+
+        if st.button("🆕 Новый чат", use_container_width=True):
+            session_mgr.create_chat()
             st.rerun()
 
-        # Показываем уведомление об удалении
-        delete_feedback = st.session_state.pop("delete_feedback", None)
-        if delete_feedback:
-            st.success(delete_feedback)
+        feedback = session_mgr.state.pop("feedback_message", None)
+        if feedback:
+            st.success(feedback)
 
-        # Отображаем список чатов с кнопками удаления
-        for chat_id, chat_data in st.session_state.chats.items():
-            title = chat_data["title"]
-            message_count = len(chat_data["messages"]) // 2  # Пары: user+bot
+        for chat_id, chat_data in list(session_mgr.chats.items()):
+            title = chat_data.get("title", "Без названия")
+            msg_count = len(chat_data.get("messages", []))
+            label = f"💬 {title} ({msg_count})" if msg_count else f"💬 {title}"
+            is_active = chat_id == session_mgr.active_chat_id
 
-            # Формируем метку с количеством сообщений для отображения
-            if message_count:
-                label = f"💬 {title} ({message_count})"
-            else:
-                label = f"💬 {title}"
-
-            # Определяем тип кнопки (выделяем активный чат)
-            is_current = chat_id == st.session_state.active_chat
-            button_type = "primary" if is_current else "secondary"
-
-            # === СТАБИЛИЗАЦИЯ ВЫРАВНИВАНИЯ ИКОНКИ УДАЛЕНИЯ ===
-            #
-            # Проблема: при изменении ширины sidebar иконка 🗑️ может
-            # "съезжать" относительно названия чата, создавая визуальный
-            # дискомфорт.
-            #
-            # Решение: используем st.columns с фиксированным процентным
-            # соотношением [0.85, 0.15], что означает:
-            # - col1 занимает 85% доступной ширины (название чата)
-            # - col2 занимает 15% доступной ширины (кнопка удаления)
-            #
-            # Почему это работает:
-            # 1. Процентное соотношение остаётся постоянным независимо
-            #    от абсолютной ширины sidebar
-            # 2. При ресайзе sidebar обе колонки масштабируются
-            #    пропорционально, сохраняя относительное положение
-            # 3. gap="small" создаёт минимальный отступ между колонками,
-            #    который также масштабируется пропорционально
-            # 4. use_container_width=True в обеих кнопках гарантирует,
-            #    что они заполняют всю доступную ширину своей колонки
-            #
-            # Результат: иконка 🗑️ всегда остаётся на одном
-            # горизонтальном уровне с названием чата, независимо от
-            # ширины sidebar (100px или 500px — не важно).
-            #
-            col1, col2 = st.columns([0.85, 0.15], gap="small")
-
-            with col1:
-                # Кнопка переключения на выбранный чат
-                # use_container_width=True — кнопка растягивается на всю
-                # ширину колонки (85% от доступного пространства)
-                # Это обеспечивает адаптивность при изменении размера
+            col_chat, col_del = st.columns([0.84, 0.16], gap="small")
+            with col_chat:
                 if st.button(
                     label,
-                    key=f"chat_btn_{chat_id}",
+                    key=f"select_{chat_id}",
                     use_container_width=True,
-                    type=button_type,
+                    type="primary" if is_active else "secondary",
                 ):
-                    # Переключаемся на выбранный чат
-                    st.session_state.active_chat = chat_id
+                    session_mgr.switch_chat(chat_id)
                     st.rerun()
-
-            with col2:
-                # Кнопка удаления чата с автоматическим центрированием
-                # Занимает фиксированные 15% от общей ширины
-                # CSS выше автоматически центрирует кнопку по вертикали
-                # Благодаря процентному соотношению колонок, иконка
-                # всегда остаётся справа на одном уровне с названием
-
-                # Кнопка удаления с иконкой корзины
-                # Центрируется автоматически через CSS (см. начало main())
+            with col_del:
                 if st.button(
                     "🗑",
-                    key=f"delete_btn_{chat_id}",
-                    help="Удалить чат",
+                    key=f"del_{chat_id}",
+                    help="Удалить этот чат",
                     use_container_width=True,
                 ):
-                    # Сохраняем ID чата для подтверждения удаления
-                    st.session_state["pending_delete"] = chat_id
+                    session_mgr.state["pending_delete"] = chat_id
                     st.rerun()
 
-        # --- Модальное окно подтверждения удаления ---
-        # Отображается, когда пользователь нажимает на 🗑️
-        if st.session_state.get("pending_delete"):
-            pending_id = st.session_state["pending_delete"]
-
-            # Находим название чата для отображения в предупреждении
-            pending_title = st.session_state.chats.get(pending_id, {}).get(
-                "title", pending_id
-            )
-
-            # Предупреждение о необратимости действия
-            st.warning(
-                f"⚠️ Вы уверены, что хотите удалить чат "
-                f'"{pending_title}"? Это действие нельзя отменить.'
-            )
-
-            # Две колонки для кнопок подтверждения и отмены
-            # Соотношение 1:1 (50% на 50%) для симметрии
-            confirm_col1, confirm_col2 = st.columns(2)
-
-            with confirm_col1:
-                # Кнопка подтверждения удаления (красная, primary)
+        # Подтверждение удаления чата
+        pending_id = session_mgr.state.get("pending_delete")
+        if pending_id and pending_id in session_mgr.chats:
+            pending_title = session_mgr.chats[pending_id].get("title", pending_id)
+            st.warning(f"⚠️ Удалить чат «{pending_title}»?")
+            c_yes, c_no = st.columns(2)
+            with c_yes:
                 if st.button(
-                    "✅ Да, удалить",
-                    key="confirm_delete",
+                    "✅ Да",
+                    key="confirm_del_btn",
                     type="primary",
                     use_container_width=True,
                 ):
-                    # Подтверждаем удаление — перемещаем из pending в confirm
-                    st.session_state["delete_confirm"] = pending_id
-                    st.session_state.pop("pending_delete", None)
+                    msg = session_mgr.delete_chat(pending_id)
+                    session_mgr.state["pending_delete"] = None
+                    session_mgr.state["feedback_message"] = msg
                     st.rerun()
-
-            with confirm_col2:
-                # Кнопка отмены (серая, secondary)
+            with c_no:
                 if st.button(
-                    "❌ Отмена",
-                    key="cancel_delete",
+                    "❌ Нет",
+                    key="cancel_del_btn",
                     use_container_width=True,
                 ):
-                    # Отменяем удаление
-                    st.session_state.pop("pending_delete", None)
+                    session_mgr.state["pending_delete"] = None
                     st.rerun()
 
-        # Переименование чата
-        st.subheader("Переименовать чат")
-
-        # Получаем текущее название активного чата
-        active_chat = st.session_state.active_chat
-        current_title = st.session_state.chats[active_chat]["title"]
-
-        new_title = st.text_input(
-            "Название текущего чата",
-            value=current_title,
-            max_chars=60,
-            help=("Введите название, чтобы легче отличать беседы."),
-            key="chat_title_input",
-        )
-
-        if st.button(
-            "💾 Сохранить название",
-            use_container_width=True,
-            help="Фиксирует выбранное название за текущим чатом.",
-        ):
-            if new_title.strip():
-                st.session_state.chats[active_chat]["title"] = new_title
-                st.session_state["rename_feedback"] = "✅ Название чата обновлено"
-                st.rerun()
-
-        rename_feedback = st.session_state.pop("rename_feedback", None)
-        if rename_feedback:
-            st.caption(rename_feedback)
-
-        st.divider()
-
-        # Экспорт чата
-        st.subheader("Экспорт")
-
-        # Получаем историю текущего активного чата
-        chat_history = st.session_state.chats[active_chat]["messages"]
-
-        # Проверяем, есть ли сообщения для экспорта
-        if chat_history:
-            # Формируем текстовое содержимое файла
-            export_lines = []
-            for message in chat_history:
-                role = message.get("role", "")
-                content = message.get("content", "")
-
-                # Преобразуем роль в читаемый формат
-                if role == "user":
-                    export_lines.append(f"User: {content}")
-                elif role == "assistant":
-                    export_lines.append(f"AI: {content}")
-
-                # Добавляем пустую строку между сообщениями
-                export_lines.append("")
-
-            # Объединяем все строки в один текст
-            export_text = "\n".join(export_lines)
-
-            # Формируем имя файла с названием чата и датой
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            chat_title = st.session_state.chats[active_chat]["title"]
-            # Убираем недопустимые символы из имени файла
-            safe_title = "".join(
-                c for c in chat_title if c.isalnum() or c in (" ", "-", "_")
-            ).strip()
-            filename = f"{safe_title}_{timestamp}.txt"
-
-            # Кнопка скачивания
-            st.download_button(
-                label="📥 Скачать чат",
-                data=export_text,
-                file_name=filename,
-                mime="text/plain",
-                use_container_width=True,
-                help="Сохранить историю текущего чата в текстовый файл",
+        with st.expander("✏️ Переименовать и экспортировать"):
+            new_title = st.text_input(
+                "Название текущего чата:",
+                value=session_mgr.active_chat.get("title", ""),
+                max_chars=60,
             )
-        else:
-            # Если чат пустой, показываем информационное сообщение
-            st.info("Нет сообщений для экспорта")
+            if st.button("💾 Сохранить название", use_container_width=True):
+                if session_mgr.rename_active_chat(new_title):
+                    session_mgr.state["feedback_message"] = "✅ Название обновлено"
+                    st.rerun()
+
+            st.markdown("---")
+            if session_mgr.active_chat.get("messages"):
+                fname, fcontent = session_mgr.export_active_chat_txt()
+                st.download_button(
+                    label="📥 Скачать чат (.txt)",
+                    data=fcontent,
+                    file_name=fname,
+                    mime="text/plain",
+                    use_container_width=True,
+                )
+            else:
+                st.caption("Добавьте сообщения, чтобы скачать историю чата.")
 
         st.divider()
 
-        # --- Быстрые промпты (шаблоны сообщений) ---
-        st.subheader("Быстрые промпты")
-
-        # Инициализируем состояние для поля ввода
-        if "prompt_input" not in st.session_state:
-            st.session_state["prompt_input"] = ""
-
-        # Словарь с готовыми шаблонами промптов
-        # Ключ — идентификатор, значение — текст шаблона
-        prompt_templates = {
-            "essay": "Напиши подробное эссе на тему: ",
-            "explain": "Объясни следующий код:\n```\n[вставь код здесь]\n```",
-            "summarize": "Кратко резюмируй следующий текст:\n",
-        }
-
-        # === СТАБИЛИЗАЦИЯ ИКОНОК БЫСТРЫХ ПРОМПТОВ ===
-        #
-        # Используем три колонки с равным соотношением [1, 1, 1]
-        # Это означает, что каждая кнопка занимает ровно 33.3%
-        # от доступной ширины sidebar.
-        #
-        # При изменении ширины sidebar все три кнопки масштабируются
-        # пропорционально, сохраняя выравнивание и интервалы.
-        #
-        col1, col2, col3 = st.columns(3)
-
-        with col1:
-            # Кнопка "Написать эссе" (✍️)
-            if st.button(
-                "✍️",
-                key="prompt_essay",
-                help="Написать эссе",
-                use_container_width=True,
-            ):
-                # Вставляем шаблон эссе в поле ввода
-                st.session_state["prompt_input"] = prompt_templates["essay"]
-                st.rerun()
-
-        with col2:
-            # Кнопка "Объяснить код" (🔍)
-            if st.button(
-                "🔍",
-                key="prompt_explain",
-                help="Объяснить код",
-                use_container_width=True,
-            ):
-                # Вставляем шаблон объяснения кода в поле ввода
-                st.session_state["prompt_input"] = prompt_templates["explain"]
-                st.rerun()
-
-        with col3:
-            # Кнопка "Резюмировать" (📝)
-            if st.button(
-                "📝",
-                key="prompt_summarize",
-                help="Резюмировать текст",
-                use_container_width=True,
-            ):
-                # Вставляем шаблон в поле ввода
-                st.session_state["prompt_input"] = prompt_templates["summarize"]
-                st.rerun()
+        # --- БЛОК 3: Быстрые промпты (шаблоны) ---
+        st.subheader("⚡ Быстрые промпты")
+        cols = st.columns(len(PROMPT_TEMPLATES))
+        for idx, (tpl_key, tpl_data) in enumerate(PROMPT_TEMPLATES.items()):
+            with cols[idx]:
+                if st.button(
+                    tpl_data["icon"],
+                    key=f"tpl_{tpl_key}",
+                    help=tpl_data["title"],
+                    use_container_width=True,
+                ):
+                    session_mgr.state["prompt_input"] = tpl_data["text"]
+                    st.rerun()
 
         st.divider()
 
-        # Правила общения
-        st.subheader("Правила общения")
-
-        # Инициализируем состояние для правил общения
-        if "chat_rules" not in st.session_state:
-            st.session_state["chat_rules"] = ""
-
-        # Текстовое поле для ввода правил
-        # Значение сохраняется автоматически в st.session_state["chat_rules"]
-        chat_rules = st.text_area(
-            "Инструкции для AI",
-            value=st.session_state["chat_rules"],
-            height=100,
+        # --- БЛОК 4: Правила общения (System Prompt) ---
+        st.subheader("📋 Правила общения")
+        rules_val = st.text_area(
+            "Системные инструкции для AI:",
+            value=session_mgr.state.get("chat_rules", ""),
+            height=90,
             placeholder=(
                 "Например:\n"
-                "- Отвечай кратко и по существу\n"
-                "- Объясняй как опытный преподаватель\n"
-                "- Используй примеры из реальной жизни"
+                "- Отвечай кратко и по делу\n"
+                "- Приводи примеры кода на Python"
             ),
-            help=(
-                "Эти инструкции будут добавлены как системный промпт "
-                "перед каждым ответом модели"
-            ),
-            key="chat_rules",
+            help="Передаются модели как системный промпт (role='system') при каждом запросе.",
         )
-
-        # Показываем статус правил
-        if chat_rules.strip():
-            st.caption("✅ Правила активны")
+        session_mgr.state["chat_rules"] = rules_val
+        if rules_val.strip():
+            st.caption("✅ Системные правила активны")
         else:
             st.caption("ℹ️ Правила не заданы")
 
         st.divider()
 
-        # Настройки
-        st.subheader("Настройки")
-        current_settings = chat_manager.get_current_settings()
-        st.session_state.setdefault(
-            "temperature_setting", float(current_settings["temperature"])
-        )
-        st.session_state.setdefault(
-            "model_setting",
-            current_settings["model_name"],
-        )
-
-        reset_clicked = st.button(
-            "↩️ Сбросить настройки",
-            use_container_width=True,
-            help="Вернуть параметры модели к значениям по умолчанию.",
-        )
-
-        if reset_clicked:
-            chat_manager.reset_settings()
-            current_settings = chat_manager.get_current_settings()
-            st.session_state["temperature_setting"] = float(
-                current_settings["temperature"]
-            )
-            st.session_state["model_setting"] = current_settings["model_name"]
-
-        model_options = current_settings["available_models"]
-        if st.session_state["model_setting"] not in model_options:
-            st.session_state["model_setting"] = current_settings["model_name"]
-
-        temperature = st.slider(
-            "Температура",
+        # --- БЛОК 5: Параметры генерации (Температура) ---
+        st.subheader("🎛️ Параметры модели")
+        temp_val = st.slider(
+            "Температура (креативность):",
             min_value=0.0,
             max_value=1.0,
-            value=float(st.session_state["temperature_setting"]),
+            value=float(
+                session_mgr.state.get("temperature", config.default_temperature)
+            ),
             step=0.05,
-            help="Чем выше температура, тем разнообразнее ответы модели.",
-            key="temperature_setting",
+        )
+        session_mgr.state["temperature"] = temp_val
+
+        if st.button("↩️ Сбросить температуру", use_container_width=True):
+            session_mgr.state["temperature"] = config.default_temperature
+            st.rerun()
+
+
+# =====================================================================
+# 6. Универсальные вспомогательные функции UI
+# =====================================================================
+
+
+def _consume_demo_quota(
+    session_mgr: ChatSessionManager,
+    rate_limiter: DemoRateLimiter,
+) -> Tuple[bool, Optional[str]]:
+    """
+    Списывает одну демо-квоту, если активен демо-режим.
+    Возвращает (True, None) при успехе или (False, сообщение_об_ошибке).
+    """
+    if session_mgr.state.get("auth_mode") != "demo":
+        return True, None
+
+    used_in_session = int(session_mgr.state.get("demo_session_used", 0))
+    quota_status = rate_limiter.consume(session_used=used_in_session)
+    if not quota_status.allowed:
+        return (
+            False,
+            (
+                f"⏳ **{quota_status.reason}**\n\n"
+                f"Время до автоматического сброса: **{quota_status.formatted_timer}**"
+            ),
+        )
+    session_mgr.state["demo_session_used"] = used_in_session + 1
+    return True, None
+
+
+def _build_prompt_with_attachment(
+    cleaned_prompt: str,
+    attached_fragment: str,
+    file_name: str,
+) -> str:
+    """
+    Добавляет контекст прикреплённого документа к сообщению пользователя.
+    Контекст передаётся модели, но в истории чата сохраняется только сам вопрос.
+    """
+    return (
+        f"[Прикреплён документ: {file_name}]\n\n"
+        f"Содержимое документа:\n---\n{attached_fragment}\n---\n\n"
+        f"Вопрос/задание пользователя:\n{cleaned_prompt}"
+    )
+
+
+# =====================================================================
+# 7. Обработка отправки сообщения
+# =====================================================================
+
+
+def handle_user_submission(
+    prompt_text: str,
+    session_mgr: ChatSessionManager,
+    llm_service: LLMService,
+    rate_limiter: DemoRateLimiter,
+) -> None:
+    """Единый обработчик отправки сообщения пользователя."""
+    cleaned_prompt = (prompt_text or "").strip()
+    if not cleaned_prompt:
+        return
+
+    is_demo = session_mgr.state.get("auth_mode") == "demo"
+
+    allowed, error_message = _consume_demo_quota(session_mgr, rate_limiter)
+    if not allowed:
+        st.error(error_message)
+        return
+
+    prior_history = list(session_mgr.active_chat.get("messages", []))
+    system_rules = str(session_mgr.state.get("chat_rules", "")).strip()
+
+    attached_fragment = session_mgr.state.get("attached_file_fragment", "")
+    attached_name = session_mgr.state.get("attached_file_name", "")
+    final_prompt = cleaned_prompt
+    if attached_fragment and attached_name:
+        final_prompt = _build_prompt_with_attachment(
+            cleaned_prompt, attached_fragment, attached_name
         )
 
-        model_name = st.selectbox(
-            "Модель",
-            model_options,
-            index=model_options.index(st.session_state["model_setting"]),
-            help="Выберите модель, которую хотите использовать для ответов.",
-            key="model_setting",
-        )
+    user_msg = session_mgr.add_message("user", cleaned_prompt)
+    render_message("user", user_msg["content"], user_msg["timestamp"])
 
-        if (
-            abs(temperature - current_settings["temperature"]) > 1e-9
-            or model_name != current_settings["model_name"]
-        ):
-            chat_manager.update_settings(
-                model_name=model_name,
-                temperature=temperature,
+    with st.chat_message("assistant"):
+        telemetry_holder: Dict = {}
+        try:
+            stream_gen = llm_service.stream_response_telemetry(
+                user_prompt=final_prompt,
+                chat_history=prior_history,
+                system_prompt=system_rules,
+                telemetry_holder=telemetry_holder,
             )
-            st.caption("✅ Настройки применены к новым сообщениям")
+            full_response = st.write_stream(stream_gen)
+            if not isinstance(full_response, str):
+                full_response = str(full_response or "")
 
-        st.caption(
-            "Текущие значения: модель — %s, температура — %.2f"
-            % (model_name, temperature)
+            telemetry = telemetry_holder.get("telemetry")
+            session_mgr.add_message(
+                "assistant",
+                full_response,
+                metadata={"telemetry": telemetry} if telemetry else None,
+            )
+            st.rerun()
+
+        except ProviderRateLimitError as exc:
+            if is_demo:
+                rate_limiter.mark_upstream_exhausted()
+                status = rate_limiter.check_status(
+                    session_used=int(session_mgr.state.get("demo_session_used", 0))
+                )
+                st.error(
+                    f"⏳ **Бесплатный лимит на день для всех пользователей превышен!**\n\n"
+                    f"Сброс лимита через: **{status.formatted_timer}**.\n"
+                    f"Включите тумблер **🔑 Свой API-ключ (BYOK)** в панели слева, "
+                    f"чтобы продолжить работу без ожидания."
+                )
+            else:
+                st.error(f"⚠️ {exc}")
+
+        except ProviderClientError as exc:
+            st.error(f"❌ {exc}")
+
+
+# =====================================================================
+# 7. Рабочее пространство «AI Чат-Ассистент»
+# =====================================================================
+
+
+def _render_attached_file_info(
+    session_mgr: ChatSessionManager,
+    clear_key: str = "clear_attached_file",
+) -> None:
+    """Показывает информацию о прикреплённом файле и кнопку удаления."""
+    file_name = session_mgr.state.get("attached_file_name", "")
+    file_tokens = session_mgr.state.get("attached_file_tokens", 0)
+    if not file_name:
+        return
+
+    col_info, col_clear = st.columns([0.8, 0.2])
+    with col_info:
+        st.info(f"📎 Прикреплён файл: **{file_name}** ({file_tokens} токенов)")
+    with col_clear:
+        if st.button("❌ Убрать файл", key=clear_key):
+            session_mgr.state["attached_file_name"] = ""
+            session_mgr.state["attached_file_tokens"] = 0
+            session_mgr.state["attached_file_fragment"] = ""
+            st.rerun()
+
+
+def _parse_and_store_uploaded_file(
+    session_mgr: ChatSessionManager,
+    uploaded_file,
+    model: str = "gpt-4o-mini",
+) -> None:
+    """Извлекает текст из загруженного файла и сохраняет его в сессии пользователя."""
+    try:
+        _, tokens, fragment = DocumentParser.prepare_context_from_upload(
+            file_bytes=uploaded_file.getvalue(),
+            filename=uploaded_file.name,
+            model=model,
         )
+        session_mgr.state["attached_file_name"] = uploaded_file.name
+        session_mgr.state["attached_file_tokens"] = tokens
+        session_mgr.state["attached_file_fragment"] = fragment
+    except DocumentParserError as exc:
+        st.error(f"❌ {exc}")
+    except Exception as exc:
+        st.error(f"❌ Ошибка обработки файла: {exc}")
 
-    # Основная область чата
-    st.title("💬 Мой ChatGPT")
-    st.caption("Базовая версия с памятью и историей чатов")
 
-    # Получаем активный чат
-    active_chat = st.session_state.active_chat
-    if not active_chat or active_chat not in st.session_state.chats:
-        st.error("❌ Активный чат не найден. Создайте новый чат.")
-        st.stop()
+def _render_chat_tab(
+    session_mgr: ChatSessionManager,
+    config: AppConfig,
+    rate_limiter: DemoRateLimiter,
+) -> None:
+    """Вкладка обычного чата с потоковыми ответами и телеметрией."""
+    llm_service, active_label = build_active_llm_service(session_mgr, config)
+    active_messages = session_mgr.active_chat.get("messages", [])
+    system_rules = str(session_mgr.state.get("chat_rules", "")).strip()
 
-    # Получаем историю текущего активного чата
-    chat_history = st.session_state.chats[active_chat]["messages"]
+    model_for_tokens = llm_service.model_name if llm_service else "gpt-4o-mini"
+    total_tokens = TokenCounter.count_chat_tokens(
+        messages=active_messages,
+        system_prompt=system_rules,
+        model=model_for_tokens,
+    )
 
-    # ============================================
-    # Счётчик токенов (верхняя панель)
-    # ============================================
-    current_settings = chat_manager.get_current_settings()
-    model_name = current_settings.get("model_name", "gpt-3.5-turbo")
-
-    # Подсчитываем общее количество токенов
-    total_tokens = calculate_total_tokens(chat_history, model_name)
-
-    # Инициализируем счётчик в session_state
-    if "total_tokens" not in st.session_state:
-        st.session_state.total_tokens = total_tokens
-    else:
-        st.session_state.total_tokens = total_tokens
-
-    # Отображаем счётчик токенов с красивым оформлением
     st.markdown(
-        f"<div style='text-align:center; color:#666; font-size:0.9em; "
-        f"padding:10px; background-color:#f0f2f6; border-radius:5px; "
-        f"margin-bottom:15px;'>"
-        f"🔢 <b>Токены в текущем чате:</b> {st.session_state.total_tokens}"
+        f"<div class='status-banner'>"
+        f"🔌 <b>Режим:</b> {active_label} &nbsp;|&nbsp; "
+        f"💬 <b>Чат:</b> {session_mgr.active_chat.get('title')} &nbsp;|&nbsp; "
+        f"🔢 <b>Токены в контексте:</b> {total_tokens}"
         f"</div>",
         unsafe_allow_html=True,
     )
 
-    # ============================================
-    # Отображение истории текущего чата
-    # ============================================
-
-    # Отображаем историю с временными метками
-    for message in chat_history:
-        role = message["role"]
-        content = message["content"]
-
-        with st.chat_message(role):
-            st.write(content)
-            # Добавляем временную метку под каждым сообщением
-            timestamp = format_timestamp()
+    if session_mgr.state.get("auth_mode") == "demo" and config.is_demo_configured:
+        demo_status = rate_limiter.check_status(
+            session_used=int(session_mgr.state.get("demo_session_used", 0))
+        )
+        if not demo_status.allowed:
             st.markdown(
-                f"<div style='font-size:0.75em; color:#999; "
-                f"text-align:right; margin-top:-10px;'>{timestamp}</div>",
+                f"<div class='limit-timer-box'>"
+                f"<h4>⏳ Бесплатный лимит запросов исчерпан</h4>"
+                f"<p>{demo_status.reason}</p>"
+                f"<p><b>До автоматического обновления лимита осталось: "
+                f"<code>{demo_status.formatted_timer}</code></b></p>"
+                f"</div>",
                 unsafe_allow_html=True,
             )
 
-    # Проверяем, был ли выбран быстрый промпт
-    # Если да, показываем текстовое поле для редактирования
-    default_value = st.session_state.get("prompt_input", "")
+    if llm_service is None:
+        st.info(
+            "👈 Для начала работы нажмите **«⚙️ Настроить API и модели»** в боковой панели "
+            "или выключите тумблер BYOK, чтобы вернуться в бесплатный Демо-режим."
+        )
+        if st.button("⚙️ Открыть окно настроек API и моделей", type="primary"):
+            open_api_settings_dialog(session_mgr, config)
+        st.stop()
 
-    if default_value:
-        # Режим редактирования быстрого промпта
-        # Показываем текстовое поле с предзаполненным шаблоном
-        st.info("✏️ Отредактируйте шаблон и нажмите Enter для отправки")
-
-        prompt = st.text_area(
-            "Ваше сообщение:",
-            value=default_value,
-            height=120,
-            key="prompt_edit_field",
+    for message in active_messages:
+        telemetry = None
+        metadata = message.get("metadata")
+        if isinstance(metadata, dict):
+            telemetry = metadata.get("telemetry")
+        render_message(
+            role=message.get("role", "user"),
+            content=message.get("content", ""),
+            timestamp=message.get("timestamp", ""),
+            telemetry=telemetry,
         )
 
-        # Кнопки для отправки или отмены
-        col1, col2 = st.columns([1, 1])
+    # Загрузка файла рядом с полем ввода (как в современных чат-ботах)
+    uploaded_file = st.file_uploader(
+        "📎 Прикрепить файл",
+        type=["txt", "md", "csv", "json", "pdf"],
+        key="chat_file_uploader",
+        label_visibility="collapsed",
+    )
+    if uploaded_file is not None:
+        _parse_and_store_uploaded_file(session_mgr, uploaded_file, model_for_tokens)
+    _render_attached_file_info(session_mgr, clear_key="clear_chat_attached_file")
 
-        with col1:
-            send_button = st.button(
-                "📤 Отправить",
-                use_container_width=True,
-                type="primary",
-            )
-
-        with col2:
-            cancel_button = st.button(
-                "❌ Отмена",
-                use_container_width=True,
-            )
-
-        # Обработка нажатия кнопок
-        if cancel_button:
-            # Отменяем — очищаем предзаполненное значение
-            st.session_state["prompt_input"] = ""
-            st.rerun()
-
-        if send_button and prompt.strip():
-            # Очищаем предзаполненное значение
-            st.session_state["prompt_input"] = ""
-
-            # Добавляем сообщение пользователя в историю
-            st.session_state.chats[active_chat]["messages"].append(
-                {"role": "user", "content": prompt}
-            )
-
-            # Отображаем сообщение пользователя с временной меткой
-            with st.chat_message("user"):
-                st.write(prompt)
-                timestamp = format_timestamp()
-                st.markdown(
-                    f"<div style='font-size:0.75em; color:#999; "
-                    f"text-align:right; margin-top:-10px;'>{timestamp}</div>",
-                    unsafe_allow_html=True,
+    draft_template = str(session_mgr.state.get("prompt_input", ""))
+    if draft_template:
+        st.info("✏️ Дополните шаблон быстрого промпта и нажмите «Отправить»:")
+        edited_prompt = st.text_area(
+            "Текст сообщения:",
+            value=draft_template,
+            height=120,
+        )
+        col_send, col_cancel = st.columns(2)
+        with col_send:
+            if st.button("📤 Отправить", type="primary", use_container_width=True):
+                session_mgr.state["prompt_input"] = ""
+                handle_user_submission(
+                    prompt_text=edited_prompt,
+                    session_mgr=session_mgr,
+                    llm_service=llm_service,
+                    rate_limiter=rate_limiter,
                 )
-
-            # Создаём placeholder для индикатора "Печатает..."
-            typing_placeholder = st.empty()
-
-            # Получаем и отображаем ответ
-            with st.chat_message("assistant"):
-                # Показываем индикатор "Печатает..." в placeholder
-                with typing_placeholder.container():
-                    show_typing_indicator(typing_placeholder, duration=1.5)
-
-                # Получаем правила общения из состояния
-                chat_rules = st.session_state.get("chat_rules", "").strip()
-
-                # Если правила заданы, добавляем их к сообщению
-                if chat_rules:
-                    # Формируем расширенный промпт с правилами
-                    enhanced_prompt = (
-                        f"[Инструкции для ответа: {chat_rules}]\n\n"
-                        f"Вопрос пользователя: {prompt}"
-                    )
-                    # Используем новый метод без сохранения в файл
-                    response = chat_manager.generate_response(
-                        enhanced_prompt,
-                        st.session_state.chats[active_chat]["messages"][:-1],
-                    )
-                else:
-                    # Отправляем сообщение без правил
-                    response = chat_manager.generate_response(
-                        prompt, st.session_state.chats[active_chat]["messages"][:-1]
-                    )
-
-                # Добавляем ответ AI в историю
-                st.session_state.chats[active_chat]["messages"].append(
-                    {"role": "assistant", "content": response}
-                )
-
-                # Очищаем индикатор "Печатает..."
-                typing_placeholder.empty()
-
-                # Отображаем ответ с временной меткой
-                st.write(response)
-                timestamp = format_timestamp()
-                st.markdown(
-                    f"<div style='font-size:0.75em; color:#999; "
-                    f"text-align:right; margin-top:-10px;'>{timestamp}</div>",
-                    unsafe_allow_html=True,
-                )
-            st.rerun()
+        with col_cancel:
+            if st.button("❌ Отмена", use_container_width=True):
+                session_mgr.state["prompt_input"] = ""
+                st.rerun()
     else:
-        # Обычный режим — стандартное поле ввода чата
-        prompt = st.chat_input("Введите ваше сообщение...")
-
-        if prompt:
-            # Добавляем сообщение пользователя в историю
-            st.session_state.chats[active_chat]["messages"].append(
-                {"role": "user", "content": prompt}
+        user_input = st.chat_input("Введите ваше сообщение...")
+        if user_input:
+            handle_user_submission(
+                prompt_text=user_input,
+                session_mgr=session_mgr,
+                llm_service=llm_service,
+                rate_limiter=rate_limiter,
             )
 
-            # Отображаем сообщение пользователя с временной меткой
-            with st.chat_message("user"):
-                st.write(prompt)
-                timestamp = format_timestamp()
-                st.markdown(
-                    f"<div style='font-size:0.75em; color:#999; "
-                    f"text-align:right; margin-top:-10px;'>{timestamp}</div>",
-                    unsafe_allow_html=True,
+
+def _infer_provider_id_from_url(base_url: str) -> str:
+    """
+    Определяет ID провайдера по URL, чтобы в демо-режиме сравнение моделей
+    показывало именно тот список, который доступен на активном демо-сервере.
+    """
+    url = base_url.lower()
+    if "groq.com" in url:
+        return "groq"
+    if "openrouter.ai" in url:
+        return "openrouter"
+    if "deepseek.com" in url:
+        return "deepseek"
+    if "anthropic.com" in url:
+        return "anthropic"
+    if "generativelanguage.googleapis.com" in url:
+        return "gemini"
+    if "dashscope" in url or "alibabacloud" in url:
+        return "qwen"
+    if "moonshot.ai" in url:
+        return "moonshot"
+    if "openai.com" in url:
+        return "openai"
+    return "openrouter"
+
+
+def _get_models_for_active_service(
+    session_mgr: ChatSessionManager,
+    base_service: LLMService,
+    config: AppConfig,
+) -> List[str]:
+    """
+    Возвращает актуальный список моделей для активного API (Demo или BYOK),
+    чтобы в сравнении не предлагались модели с другого сервера.
+    """
+    is_demo = session_mgr.state.get("auth_mode") == "demo"
+    if is_demo:
+        # В демо-режиме модели могли быть подгружены под ключом __demo__
+        demo_models = session_mgr.state.get("fetched_models", {}).get("__demo__")
+        if demo_models:
+            return demo_models
+        provider_id = _infer_provider_id_from_url(config.demo_base_url)
+    else:
+        provider_id = session_mgr.state.get("provider_id", "openrouter")
+    return get_models_for_provider(session_mgr, provider_id)
+
+
+def _render_model_comparison(
+    session_mgr: ChatSessionManager,
+    config: AppConfig,
+    rate_limiter: DemoRateLimiter,
+) -> None:
+    """Вкладка сравнения двух выбранных моделей по одному промпту."""
+    st.subheader("⚔️ Сравнение 2 моделей")
+    st.caption(
+        "Один промпт отправляется двум моделям. "
+        "Ниже наглядно сравниваются скорость и качество ответа."
+    )
+
+    # Базовый сервис нужен для получения кредов и определения провайдера
+    base_service, _ = build_active_llm_service(session_mgr, config, max_tokens=2048)
+    if base_service is None:
+        st.warning(
+            "Для сравнения моделей сначала настройте API-ключ или включите Демо-режим."
+        )
+        return
+
+    available_models = _get_models_for_active_service(
+        session_mgr, base_service, config
+    )
+    provider = get_provider(
+        _infer_provider_id_from_url(base_service.base_url)
+        if session_mgr.state.get("auth_mode") == "demo"
+        else session_mgr.state.get("provider_id", "openrouter")
+    )
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        current_model = base_service.model_name
+        index_a = (
+            available_models.index(current_model)
+            if current_model in available_models
+            else 0
+        )
+        model_a = st.selectbox(
+            "Модель A",
+            options=available_models,
+            index=index_a,
+            key="compare_model_a",
+        )
+    with col_b:
+        default_b = provider.default_model
+        index_b = (
+            available_models.index(default_b)
+            if default_b in available_models
+            else 0
+        )
+        model_b = st.selectbox(
+            "Модель B",
+            options=available_models,
+            index=index_b,
+            key="compare_model_b",
+        )
+
+    compare_prompt = st.text_area(
+        "Промпт для сравнения:",
+        height=120,
+        placeholder="Введите один и тот же промпт для обеих моделей...",
+    )
+
+    # Загрузка файла для сравнения (документ добавляется к промпту)
+    uploaded_file = st.file_uploader(
+        "📎 Прикрепить файл к сравнению",
+        type=["txt", "md", "csv", "json", "pdf"],
+        key="compare_file_uploader",
+        label_visibility="collapsed",
+    )
+    if uploaded_file is not None:
+        _parse_and_store_uploaded_file(
+            session_mgr, uploaded_file, base_service.model_name
+        )
+    _render_attached_file_info(session_mgr, clear_key="clear_compare_attached_file")
+
+    if not st.button("🚀 Запустить сравнение", type="primary"):
+        return
+
+    cleaned_prompt = compare_prompt.strip()
+    if not cleaned_prompt:
+        st.warning("Сначала введите промпт для сравнения.")
+        return
+
+    # Если прикреплён файл — добавляем его содержимое к промпту
+    attached_fragment = session_mgr.state.get("attached_file_fragment", "")
+    attached_name = session_mgr.state.get("attached_file_name", "")
+    final_prompt = cleaned_prompt
+    if attached_fragment and attached_name:
+        final_prompt = _build_prompt_with_attachment(
+            cleaned_prompt, attached_fragment, attached_name
+        )
+
+    def run_side(model_name: str, side_label: str):
+        allowed, err = _consume_demo_quota(session_mgr, rate_limiter)
+        if not allowed:
+            return {"error": err}
+        try:
+            service = LLMService(
+                api_key=base_service.api_key,
+                base_url=base_service.base_url,
+                model_name=model_name,
+                temperature=base_service.temperature,
+                max_tokens=2048,
+            )
+            content, telemetry = service.generate_response_telemetry(
+                user_prompt=final_prompt,
+                chat_history=[],
+                system_prompt=str(session_mgr.state.get("chat_rules", "")).strip(),
+            )
+            return {"content": content, "telemetry": telemetry}
+        except ProviderRateLimitError as exc:
+            if session_mgr.state.get("auth_mode") == "demo":
+                rate_limiter.mark_upstream_exhausted()
+            return {"error": str(exc)}
+        except ProviderClientError as exc:
+            return {"error": str(exc)}
+
+    with st.spinner("Ожидаем ответы от моделей..."):
+        result_a = run_side(model_a, "A")
+        result_b = run_side(model_b, "B")
+
+    col_res_a, col_res_b = st.columns(2)
+    with col_res_a:
+        st.markdown(f"### 🅰️ {model_a}")
+        if "error" in result_a:
+            st.error(result_a["error"])
+        else:
+            st.markdown(result_a["content"])
+            st.caption(result_a["telemetry"].format_line())
+    with col_res_b:
+        st.markdown(f"### 🅱️ {model_b}")
+        if "error" in result_b:
+            st.error(result_b["error"])
+        else:
+            st.markdown(result_b["content"])
+            st.caption(result_b["telemetry"].format_line())
+
+
+def render_chat_workspace(
+    session_mgr: ChatSessionManager,
+    config: AppConfig,
+    rate_limiter: DemoRateLimiter,
+) -> None:
+    """Отрисовывает рабочее пространство универсального чата."""
+    st.title("🤖 AI Chat Hub")
+    st.caption(
+        "Универсальный AI-ассистент: бесплатный демо-режим + поддержка BYOK "
+        "(OpenRouter, DeepSeek, OpenAI, Claude, Gemini, Groq, Qwen)"
+    )
+
+    chat_tab, compare_tab = st.tabs(["💬 Чат", "⚔️ Сравнение 2 моделей"])
+    with chat_tab:
+        _render_chat_tab(session_mgr, config, rate_limiter)
+    with compare_tab:
+        _render_model_comparison(session_mgr, config, rate_limiter)
+
+
+# =====================================================================
+# 8. Рабочее пространство «Jira & PM Copilot»
+# =====================================================================
+
+
+@st.dialog("🚀 Отправка задач в Jira", width="large")
+def open_jira_push_dialog(issues: List[JiraIssue]) -> None:
+    """Модальное окно для отправки сгенерированных задач в реальный проект Jira."""
+    st.caption(
+        "Укажите параметры Jira Cloud. Задачи будут созданы через REST API v3 "
+        "(/rest/api/3/issue)."
+    )
+    domain = st.text_input(
+        "Jira Domain:",
+        placeholder="https://your-domain.atlassian.net",
+        help="Базовый URL вашего Jira Cloud",
+    )
+    email = st.text_input("Email пользователя:", placeholder="user@example.com")
+    api_token = st.text_input(
+        "Jira API Token:",
+        type="password",
+        help="Создаётся в настройках профиля Jira → Security → API tokens",
+    )
+    project_key = st.text_input(
+        "Project Key:",
+        placeholder="PROJ",
+        help="Ключ проекта в Jira",
+    )
+
+    if not st.button("📤 Отправить задачи в Jira", type="primary"):
+        return
+
+    if not domain or not email or not api_token or not project_key:
+        st.error("Заполните все поля для подключения к Jira.")
+        return
+
+    push_service = JiraPushService(
+        domain=domain,
+        email=email,
+        api_token=api_token,
+        project_key=project_key,
+    )
+    with st.spinner("Отправка задач в Jira..."):
+        results = push_service.push_issues(issues)
+
+    for result in results:
+        if result.get("ok"):
+            st.success(f"✅ Создано: {result['summary']}")
+        else:
+            st.error(f"❌ Ошибка для «{result['summary']}»: {result.get('body')}")
+
+
+def render_jira_workspace(
+    session_mgr: ChatSessionManager,
+    config: AppConfig,
+    rate_limiter: DemoRateLimiter,
+) -> None:
+    """Отрисовывает рабочее пространство проектного менеджера и Jira."""
+    st.title("📋 Jira & PM Copilot")
+    st.caption(
+        "Декомпозиция требований, AI-оценка методом PERT и аудит рисков для проектных команд"
+    )
+
+    # --- Ввод требований и загрузка файла ---
+    col_input, col_file = st.columns([0.7, 0.3])
+    with col_input:
+        requirements = st.text_area(
+            "Сырые требования / описание проекта:",
+            value=session_mgr.state.get("jira_requirements", ""),
+            height=180,
+            placeholder=(
+                "Например: Создать личный кабинет клиента с авторизацией, "
+                "историей заказов и уведомлениями..."
+            ),
+        )
+    with col_file:
+        uploaded = st.file_uploader(
+            "📎 Загрузить ТЗ / протокол созвона",
+            type=["txt", "md", "csv", "json", "pdf"],
+            key="jira_file_uploader",
+        )
+        if uploaded is not None:
+            try:
+                full_text, tokens, fragment = DocumentParser.prepare_context_from_upload(
+                    file_bytes=uploaded.getvalue(),
+                    filename=uploaded.name,
                 )
-
-            # Создаём placeholder для индикатора "Печатает..."
-            typing_placeholder = st.empty()
-
-            # Получаем и отображаем ответ
-            with st.chat_message("assistant"):
-                # Показываем индикатор "Печатает..." в placeholder
-                with typing_placeholder.container():
-                    show_typing_indicator(typing_placeholder, duration=1.5)
-
-                # Получаем правила общения из состояния
-                chat_rules = st.session_state.get("chat_rules", "").strip()
-
-                # Если правила заданы, добавляем их к сообщению
-                if chat_rules:
-                    # Формируем расширенный промпт с правилами
-                    enhanced_prompt = (
-                        f"[Инструкции для ответа: {chat_rules}]\n\n"
-                        f"Вопрос пользователя: {prompt}"
-                    )
-                    # Используем новый метод без сохранения в файл
-                    response = chat_manager.generate_response(
-                        enhanced_prompt,
-                        st.session_state.chats[active_chat]["messages"][:-1],
-                    )
-                else:
-                    # Отправляем сообщение без правил
-                    response = chat_manager.generate_response(
-                        prompt, st.session_state.chats[active_chat]["messages"][:-1]
-                    )
-
-                # Добавляем ответ AI в историю
-                st.session_state.chats[active_chat]["messages"].append(
-                    {"role": "assistant", "content": response}
+                # Автоматически дополняем поле требований содержимым файла
+                current = session_mgr.state.get("jira_requirements", "")
+                separator = "\n\n" if current.strip() else ""
+                session_mgr.state["jira_requirements"] = (
+                    current + separator + fragment
                 )
+                st.success(f"✅ Загружено {tokens} токенов из {uploaded.name}")
+                st.rerun()
+            except DocumentParserError as exc:
+                st.error(f"❌ {exc}")
+            except Exception as exc:
+                st.error(f"❌ Ошибка обработки файла: {exc}")
 
-                # Очищаем индикатор "Печатает..."
-                typing_placeholder.empty()
+    session_mgr.state["jira_requirements"] = requirements
 
-                # Отображаем ответ с временной меткой
-                st.write(response)
-                timestamp = format_timestamp()
-                st.markdown(
-                    f"<div style='font-size:0.75em; color:#999; "
-                    f"text-align:right; margin-top:-10px;'>{timestamp}</div>",
-                    unsafe_allow_html=True,
+    analysis_options = {
+        AnalysisType.DECOMPOSITION: AnalysisType.label(AnalysisType.DECOMPOSITION),
+        AnalysisType.ESTIMATION: AnalysisType.label(AnalysisType.ESTIMATION),
+        AnalysisType.RISKS: AnalysisType.label(AnalysisType.RISKS),
+    }
+    selected_types = st.multiselect(
+        "Выберите виды PM-анализа:",
+        options=list(analysis_options.keys()),
+        default=session_mgr.state.get("jira_analysis_types", list(analysis_options.keys())),
+        format_func=lambda key: analysis_options[key],
+    )
+    session_mgr.state["jira_analysis_types"] = selected_types
+
+    if not selected_types:
+        st.info("Выберите хотя бы один вид анализа.")
+        st.stop()
+
+    run_disabled = not requirements.strip()
+    if st.button(
+        "🔍 Запустить AI-анализ",
+        type="primary",
+        disabled=run_disabled,
+    ):
+        allowed, err = _consume_demo_quota(session_mgr, rate_limiter)
+        if not allowed:
+            st.error(err)
+            return
+
+        llm_service, _ = build_active_llm_service(
+            session_mgr, config, max_tokens=4096
+        )
+        if llm_service is None:
+            st.warning(
+                "Для анализа настройте API-ключ или включите бесплатный Демо-режим."
+            )
+            return
+
+        with st.spinner("AI анализирует требования, оценивает сроки и риски..."):
+            pm_service = JiraPMService(llm_service)
+            try:
+                result = pm_service.analyze(
+                    requirements=requirements,
+                    analysis_types=selected_types,
                 )
-            st.rerun()
+                session_mgr.state["jira_result"] = result
+            except ProviderRateLimitError as exc:
+                if session_mgr.state.get("auth_mode") == "demo":
+                    rate_limiter.mark_upstream_exhausted()
+                st.error(f"⚠️ {exc}")
+            except ProviderClientError as exc:
+                st.error(f"❌ {exc}")
+
+    result = session_mgr.state.get("jira_result")
+    if result is None:
+        return
+
+    st.divider()
+    st.subheader("📊 Результаты анализа")
+    if result.telemetry:
+        st.caption(result.telemetry.format_line())
+
+    # --- Таблица задач ---
+    if result.issues:
+        table_data = [
+            {
+                "Issue Type": issue.issue_type,
+                "Summary": issue.summary,
+                "Description": issue.description,
+                "Acceptance Criteria": issue.acceptance_criteria,
+                "Priority": issue.priority,
+                "Original Estimate (h)": issue.original_estimate_hours,
+                "Story Points": issue.story_points,
+                "Parent": issue.parent_summary or "",
+            }
+            for issue in result.issues
+        ]
+        st.dataframe(table_data, use_container_width=True, hide_index=True)
+
+        # --- Экспорт ---
+        csv_content = JiraPMService.export_jira_csv(result.issues)
+        md_content = result.report_markdown
+        col_csv, col_md = st.columns(2)
+        with col_csv:
+            st.download_button(
+                label="📥 Скачать Jira CSV",
+                data=csv_content,
+                file_name="jira_import.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+        with col_md:
+            st.download_button(
+                label="📥 Скачать отчёт (.md)",
+                data=md_content,
+                file_name="pm_report.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+
+        # --- Отправка в Jira (опционально) ---
+        if st.button("🚀 Отправить задачи в Jira", use_container_width=True):
+            open_jira_push_dialog(result.issues)
+    else:
+        st.info("Модель не вернула структурированных задач. Попробуйте уточнить требования.")
+
+    # --- Риски и вопросы ---
+    if result.risks:
+        with st.expander(f"🚨 Риски ({len(result.risks)})"):
+            risk_data = [
+                {
+                    "Риск": risk.risk,
+                    "Вероятность": risk.probability,
+                    "Влияние": risk.impact,
+                    "Митигация": risk.mitigation,
+                }
+                for risk in result.risks
+            ]
+            st.dataframe(risk_data, use_container_width=True, hide_index=True)
+
+    if result.clarifying_questions:
+        with st.expander(f"❓ Уточняющие вопросы ({len(result.clarifying_questions)})"):
+            for question in result.clarifying_questions:
+                st.markdown(f"- {question}")
+
+    # --- Сырой ответ модели (для отладки) ---
+    with st.expander("🧪 Сырой ответ модели"):
+        st.markdown(result.raw_response)
+
+
+# =====================================================================
+# 9. Главная функция приложения
+# =====================================================================
+
+
+def main() -> None:
+    """Точка входа в приложение."""
+    inject_custom_css()
+
+    config = get_app_config()
+    rate_limiter = get_global_rate_limiter(
+        daily_limit=config.demo_daily_global_limit,
+        session_limit=config.demo_session_limit,
+    )
+    session_mgr = ChatSessionManager(
+        state=st.session_state,
+        default_demo_enabled=config.is_demo_configured,
+        default_temperature=config.default_temperature,
+    )
+
+    render_sidebar(session_mgr, config, rate_limiter)
+
+    workspace_mode = session_mgr.state.get("workspace_mode", "chat")
+    if workspace_mode == "jira":
+        render_jira_workspace(session_mgr, config, rate_limiter)
+    else:
+        render_chat_workspace(session_mgr, config, rate_limiter)
 
 
 if __name__ == "__main__":

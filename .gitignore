@@ -38,7 +38,15 @@ env/
 
 # Переменные окружения
 .env
-.env.local
+.env.*
+!.env.example
+
+# Секреты Streamlit Cloud
+.streamlit/secrets.toml
+!.streamlit/secrets.toml.example
+
+# Локальные загрузки и данные
+uploads/
 
 # Логи
 *.log
